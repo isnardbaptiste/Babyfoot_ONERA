@@ -17,6 +17,7 @@ const MAX_SCORE = 10;
 const PERLES_NEG = Array.from({ length: -MIN_SCORE }, (_, i) => MIN_SCORE + i); // -5 … -1
 const PERLES_POS = Array.from({ length: MAX_SCORE }, (_, i) => i + 1); // 1 … 10
 const AN_MS = 365 * 24 * 60 * 60 * 1000;
+const INACTIF_MS = 91 * 24 * 60 * 60 * 1000; // ~3 mois sans jouer → sortie du classement, Elo remis à 1500
 const MODES = [
   { id: "general", label: "Général" },
   { id: "attaque", label: "Attaque" },
@@ -65,15 +66,27 @@ function deltasMatch(etat, m) {
 }
 
 function ligneVide(id, nom) {
-  const role = () => ({ j: 0, v: 0, d: 0, bp: 0, bc: 0, forme: [], dernier: 0 });
+  const role = () => ({
+    j: 0, v: 0, d: 0, bp: 0, bc: 0, forme: [], dernier: 0,
+    // confrontations par mode : coequipiers[idAutre] = {j, v}, adversaires[idAutre] = {j, v}
+    coequipiers: {}, adversaires: {},
+  });
   return {
     id, nom,
     general: START, attaque: START, defense: START,
+    dernierJoue: null, // date du dernier match joué, pour la règle d'inactivité
     stats: { general: role(), attaque: role(), defense: role() },
   };
 }
 
-function calculerLigue(joueurs, matchs) {
+// Enregistre un duel (coéquipier ou adversaire) dans une sous-table de stats.
+function noter(table, autreId, gagne) {
+  const e = table[autreId] || (table[autreId] = { j: 0, v: 0 });
+  e.j += 1;
+  if (gagne) e.v += 1;
+}
+
+function calculerLigue(joueurs, matchs, maintenant = Date.now()) {
   const etat = {};
   joueurs.forEach((j) => { etat[j.id] = ligneVide(j.id, j.nom); });
 
@@ -83,13 +96,26 @@ function calculerLigue(joueurs, matchs) {
   for (const m of ordonnes) {
     const ids = [m.a.atk, m.a.def, m.b.atk, m.b.def];
     if (ids.some((id) => !etat[id])) continue; // joueur supprimé : match ignoré
+    const quand = new Date(m.date).getTime();
+
+    // Règle d'inactivité : une absence de plus de 3 mois coupe le fil de l'Elo.
+    // Au retour, le joueur repart de 1500 (attaque et défense) avant de jouer ce match.
+    for (const id of ids) {
+      const p = etat[id];
+      if (p.dernierJoue !== null && quand - p.dernierJoue > INACTIF_MS) {
+        p.attaque = START;
+        p.defense = START;
+        p.general = START;
+      }
+    }
+
     const d = deltasMatch(etat, m);
 
     const membres = [
-      { id: m.a.atk, role: "attaque", eq: "a" },
-      { id: m.a.def, role: "defense", eq: "a" },
-      { id: m.b.atk, role: "attaque", eq: "b" },
-      { id: m.b.def, role: "defense", eq: "b" },
+      { id: m.a.atk, role: "attaque", eq: "a", coeq: m.a.def, adv: [m.b.atk, m.b.def] },
+      { id: m.a.def, role: "defense", eq: "a", coeq: m.a.atk, adv: [m.b.atk, m.b.def] },
+      { id: m.b.atk, role: "attaque", eq: "b", coeq: m.b.def, adv: [m.a.atk, m.a.def] },
+      { id: m.b.def, role: "defense", eq: "b", coeq: m.b.atk, adv: [m.a.atk, m.a.def] },
     ];
 
     for (const mb of membres) {
@@ -104,6 +130,7 @@ function calculerLigue(joueurs, matchs) {
       p.defense += dDef;
       // Le général suit mécaniquement : moyenne de l'attaque et de la défense.
       p.general = (p.attaque + p.defense) / 2;
+      p.dernierJoue = quand;
 
       p.stats.attaque.dernier = dAtt;
       p.stats.defense.dernier = dDef;
@@ -112,21 +139,29 @@ function calculerLigue(joueurs, matchs) {
       const bp = mb.eq === "a" ? m.sa : m.sb;
       const bc = mb.eq === "a" ? m.sb : m.sa;
       const gagne = bp > bc;
-      // Les compteurs de matchs ne bougent que pour le poste réellement tenu.
+      // Les compteurs de matchs ne bougent que pour le poste réellement tenu, plus le général.
       for (const cle of [mb.role, "general"]) {
         const s = p.stats[cle];
         s.j += 1;
         s[gagne ? "v" : "d"] += 1;
         s.bp += bp; s.bc += bc;
         s.forme.push(gagne ? "V" : "D");
+        noter(s.coequipiers, mb.coeq, gagne);
+        mb.adv.forEach((idAdv) => noter(s.adversaires, idAdv, gagne));
       }
     }
 
     enrichis.push({ ...m, delta: d.spec, mult: d.mult, moyA: d.noteA, moyB: d.noteB });
   }
 
-  const classement = Object.values(etat);
-  return { classement, index: etat, matchs: enrichis.reverse() };
+  // Un joueur est "actif" s'il a joué dans les 3 derniers mois. Les inactifs
+  // sortent du classement (mais gardent leur historique et leurs stats de saison).
+  const classement = Object.values(etat).map((p) => ({
+    ...p,
+    actif: p.dernierJoue !== null && maintenant - p.dernierJoue <= INACTIF_MS,
+  }));
+
+  return { classement, index: Object.fromEntries(classement.map((p) => [p.id, p])), matchs: enrichis.reverse() };
 }
 
 /* ── Petits éléments graphiques ────────────────────────────── */
@@ -274,17 +309,28 @@ const affScore = (n) => (n < 0 ? "−" + Math.abs(n) : String(n));
 
 /* ── Vues ──────────────────────────────────────────────────── */
 
-function Classement({ ligue, mode, setMode }) {
+function Classement({ ligue, mode, setMode, onJoueur }) {
+  // Seuls les joueurs actifs (un match dans les 3 derniers mois) figurent au classement.
   const lignes = useMemo(
-    () => [...ligue.classement].sort((a, b) => b[mode] - a[mode]),
+    () => ligue.classement.filter((p) => p.actif).sort((a, b) => b[mode] - a[mode]),
     [ligue, mode]
   );
+  const inactifs = ligue.classement.filter((p) => !p.actif && p.dernierJoue !== null).length;
 
-  if (!lignes.length) {
+  if (!ligue.classement.length) {
     return (
       <div className="bf-vide">
         <p>Le classement est vide.</p>
         <p className="bf-vide-sous">Ajoutez vos collègues dans l'onglet Joueurs pour démarrer la saison.</p>
+      </div>
+    );
+  }
+
+  if (!lignes.length) {
+    return (
+      <div className="bf-vide">
+        <p>Personne n'a joué ces trois derniers mois.</p>
+        <p className="bf-vide-sous">Un match remet son auteur au classement, Elo repart de {START}.</p>
       </div>
     );
   }
@@ -321,7 +367,13 @@ function Classement({ ligue, mode, setMode }) {
           const rangFin = lignes.length - 1 - i;
           const bas = !haut && s.j > 0 && lignes.length >= 6 && rangFin < 3 ? MENTIONS_BAS[rangFin] : null;
           return (
-            <div className="bf-tr" role="row" key={p.id}>
+            <div
+              className="bf-tr bf-tr-clic"
+              role="row"
+              key={p.id}
+              onClick={() => onJoueur(p.id)}
+              title={`Voir les statistiques de ${p.nom}`}
+            >
               <span className="bf-c-rang"><i className={"bf-rang r" + (i < 3 ? i + 1 : 0)}>{i + 1}</i></span>
               <span className="bf-c-nom">
                 <span className="bf-nom-ligne">
@@ -355,10 +407,18 @@ function Classement({ ligue, mode, setMode }) {
         })}
       </div>
       <p className="bf-note">
-        Départ à {START} · général = moyenne attaque/défense · K={K} · variation minimale de {PLANCHER} points.
+        Touchez un joueur pour ses statistiques. Départ à {START} · général = moyenne attaque/défense · K={K} ·
+        variation minimale de {PLANCHER} points.
         <br />
         Le poste tenu prend 3/4 de la variation, l'autre poste 1/4. Multiplicateur d'écart de buts :
         ×1 de 1 à 3 · ×2 de 4 à 5 · ×3 à 6 · ×4 à 7 · ×5 à partir de 8.
+        {inactifs > 0 && (
+          <>
+            <br />
+            {inactifs} joueur{inactifs > 1 ? "s" : ""} masqué{inactifs > 1 ? "s" : ""} pour plus de 3 mois sans jouer ·
+            un match les ramène, Elo remis à {START}.
+          </>
+        )}
       </p>
     </>
   );
@@ -521,7 +581,57 @@ function Deverrouiller({ onDeverrouiller, texte }) {
   );
 }
 
-function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer }) {
+// Édition en ligne d'un match : mêmes règles que la saisie (4 joueurs distincts, pas d'égalité).
+function EditionMatch({ match, joueurs, onEnregistrer, onAnnuler }) {
+  const [a, setA] = useState({ ...match.a });
+  const [b, setB] = useState({ ...match.b });
+  const [sa, setSa] = useState(match.sa);
+  const [sb, setSb] = useState(match.sb);
+  const [err, setErr] = useState("");
+
+  const pris = [a.atk, a.def, b.atk, b.def].filter(Boolean);
+
+  const enregistrer = () => {
+    if (pris.length !== 4 || new Set(pris).size !== 4)
+      return setErr("Quatre joueurs différents sont requis.");
+    if (sa === sb) return setErr("Il faut un vainqueur.");
+    setErr("");
+    onEnregistrer({ a, b, sa, sb });
+  };
+
+  return (
+    <li className="bf-match bf-match-edit">
+      <div className="bf-edit-camps">
+        {[
+          { eq: a, set: setA, cle: "rouge", titre: "Rouges", score: sa, setScore: setSa },
+          { eq: b, set: setB, cle: "bleu", titre: "Bleus", score: sb, setScore: setSb },
+        ].map((c) => (
+          <div className={"bf-edit-camp " + c.cle} key={c.cle}>
+            <h4>{c.titre}</h4>
+            <label className="bf-poste-mini">Attaque
+              <Choix value={c.eq.atk} onChange={(v) => c.set({ ...c.eq, atk: v })}
+                joueurs={joueurs} exclus={pris} placeholder="Choisir…" />
+            </label>
+            <label className="bf-poste-mini">Défense
+              <Choix value={c.eq.def} onChange={(v) => c.set({ ...c.eq, def: v })}
+                joueurs={joueurs} exclus={pris} placeholder="Choisir…" />
+            </label>
+            <Boulier value={c.score} onChange={c.setScore} couleur={`var(--${c.cle})`} label={`Buts des ${c.titre}`} />
+          </div>
+        ))}
+      </div>
+      {err && <p className="bf-erreur">{err}</p>}
+      <div className="bf-edit-actions">
+        <button className="bf-cta petit" onClick={enregistrer}>Enregistrer</button>
+        <button className="bf-lien" onClick={onAnnuler}>Annuler</button>
+      </div>
+    </li>
+  );
+}
+
+function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer, onModifier }) {
+  const [edite, setEdite] = useState(null); // id du match en cours d'édition
+
   if (!ligue.matchs.length) {
     return (
       <div className="bf-vide">
@@ -534,10 +644,26 @@ function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer })
   const date = (iso) =>
     new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 
+  const enregistrer = async (id, modif) => {
+    await onModifier(id, modif);
+    setEdite(null);
+  };
+
   return (
     <>
       <ul className="bf-histo">
         {ligue.matchs.map((m) => {
+          if (edite === m.id) {
+            return (
+              <EditionMatch
+                key={m.id}
+                match={m}
+                joueurs={ligue.classement}
+                onEnregistrer={(modif) => enregistrer(m.id, modif)}
+                onAnnuler={() => setEdite(null)}
+              />
+            );
+          }
           const rougeGagne = m.sa > m.sb;
           return (
             <li className="bf-match" key={m.id}>
@@ -559,9 +685,10 @@ function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer })
                 </div>
               </div>
               {admin && (
-                <button className="bf-suppr" onClick={() => onSupprimer(m.id)} aria-label="Supprimer ce match">
-                  Supprimer
-                </button>
+                <div className="bf-match-admin">
+                  <button className="bf-lien" onClick={() => setEdite(m.id)}>Modifier</button>
+                  <button className="bf-lien danger" onClick={() => onSupprimer(m.id)}>Supprimer</button>
+                </div>
               )}
             </li>
           );
@@ -570,7 +697,7 @@ function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer })
 
       {admin ? (
         <p className="bf-note">
-          Zone déverrouillée : chaque match peut être supprimé, les Elo se recalculent aussitôt.{" "}
+          Zone déverrouillée : chaque match peut être modifié ou supprimé, les Elo se recalculent aussitôt.{" "}
           <button className="bf-lien" onClick={verrouiller}>Verrouiller</button>
         </p>
       ) : (
@@ -578,10 +705,150 @@ function Historique({ ligue, admin, onDeverrouiller, verrouiller, onSupprimer })
           <h3 className="bf-zone-titre">Zone protégée</h3>
           <Deverrouiller
             onDeverrouiller={onDeverrouiller}
-            texte="Supprimer le score d'un match demande le code de la ligue."
+            texte="Modifier ou supprimer un match demande le code de la ligue."
           />
         </section>
       )}
+    </>
+  );
+}
+
+/* ── Statistiques par joueur ───────────────────────────────── */
+
+// Une colonne de confrontations (coéquipiers ou adversaires), triée par nombre de matchs.
+function ColonneDuels({ titre, legGauche, legDroite, verbe, table, index }) {
+  const lignes = Object.entries(table)
+    .map(([id, e]) => ({ nom: index[id]?.nom ?? "?", v: e.v, j: e.j }))
+    .sort((x, y) => y.j - x.j || y.v - x.v);
+
+  return (
+    <div className="bf-stat-col">
+      <h3 className="bf-stat-col-titre">{titre}</h3>
+      <p className="bf-stat-leg">
+        <i className="bf-sw clair" /> {legGauche}
+        <i className="bf-sw fonce" /> {legDroite}
+      </p>
+      {lignes.length ? (
+        <ul className="bf-duels">
+          {lignes.map((l) => (
+            <li key={l.nom}>
+              <span className="bf-duel-nom">{l.nom}</span>
+              <span className="bf-duel-barre" aria-label={`${l.v} ${verbe} sur ${l.j}`}>
+                <span className="bf-duel-fond" style={{ width: (l.j / lignes[0].j) * 100 + "%" }}>
+                  <span className="bf-duel-plein" style={{ width: (l.v / l.j) * 100 + "%" }} />
+                </span>
+              </span>
+              <span className="bf-duel-chiffre">{l.v}<em> / {l.j}</em></span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="bf-muet bf-duel-vide">aucune donnée dans ce classement</p>
+      )}
+    </div>
+  );
+}
+
+function Statistiques({ ligue, selection, setSelection }) {
+  const [mode, setMode] = useState("general");
+
+  // Joueurs ayant au moins un match, triés par volume de matchs (généraux).
+  const joueurs = useMemo(
+    () =>
+      ligue.classement
+        .filter((p) => p.stats.general.j > 0)
+        .sort((a, b) => b.stats.general.j - a.stats.general.j),
+    [ligue]
+  );
+
+  // Le joueur montré : la sélection si elle est valable, sinon le plus actif.
+  const choisi =
+    (selection && ligue.index[selection]?.stats.general.j > 0 && ligue.index[selection]) ||
+    joueurs[0] ||
+    null;
+
+  if (!choisi) {
+    return (
+      <div className="bf-vide">
+        <p>Aucune statistique pour l'instant.</p>
+        <p className="bf-vide-sous">Elles apparaîtront dès le premier match enregistré.</p>
+      </div>
+    );
+  }
+
+  const s = choisi.stats[mode];
+  const pct = s.j ? Math.round((s.v / s.j) * 100) : 0;
+  const labelMode = MODES.find((m) => m.id === mode).label.toLowerCase();
+
+  return (
+    <>
+      <div className="bf-stat-choix" role="tablist" aria-label="Choisir un joueur">
+        {joueurs.map((p) => (
+          <button
+            key={p.id}
+            role="tab"
+            aria-selected={p.id === choisi.id}
+            className={"bf-chip" + (p.id === choisi.id ? " on" : "")}
+            onClick={() => setSelection(p.id)}
+          >
+            {p.nom}<b>{p.stats.general.j}</b>
+          </button>
+        ))}
+      </div>
+
+      <div className="bf-segments" role="tablist" aria-label="Type de statistiques">
+        {MODES.map((m) => (
+          <button
+            key={m.id}
+            role="tab"
+            aria-selected={mode === m.id}
+            className={"bf-seg" + (mode === m.id ? " on" : "")}
+            onClick={() => setMode(m.id)}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="bf-stat-tete">
+        <h2 className="bf-stat-nom">{choisi.nom}</h2>
+        {s.j ? (
+          <div className="bf-stat-kpis">
+            <span><b>{s.j}</b> match{s.j > 1 ? "s" : ""}</span>
+            <span><b>{s.v}</b> victoire{s.v > 1 ? "s" : ""}</span>
+            <span><b>{pct}</b><em> %</em> de victoires</span>
+            <span className="bf-stat-elo"><b>{Math.round(choisi[mode])}</b> Elo{!choisi.actif ? " · inactif" : ""}</span>
+          </div>
+        ) : (
+          <p className="bf-muet">Aucun match en {labelMode}.</p>
+        )}
+      </div>
+
+      {s.j > 0 && (
+        <div className="bf-stat-grille">
+          <ColonneDuels
+            titre="Avec qui il joue"
+            legGauche="Matchs ensemble"
+            legDroite="Victoires"
+            verbe="gagnés ensemble"
+            table={s.coequipiers}
+            index={ligue.index}
+          />
+          <ColonneDuels
+            titre="Contre qui il gagne"
+            legGauche="Affrontés"
+            legDroite="Battus"
+            verbe="battus"
+            table={s.adversaires}
+            index={ligue.index}
+          />
+        </div>
+      )}
+
+      <p className="bf-note">
+        Statistiques en {labelMode}, sur toute la saison — y compris les matchs d'avant une éventuelle pause.
+        Les barres claires comptent les matchs, les barres foncées les victoires.
+      </p>
     </>
   );
 }
@@ -750,6 +1017,7 @@ export default function LigueBabyfoot() {
   const [mode, setMode] = useState("general");
   const [alerte, setAlerte] = useState("");
   const [code, setCode] = useState(null); // code de la ligue, gardé en mémoire seulement
+  const [selection, setSelection] = useState(null); // joueur affiché dans l'onglet Stats
   const admin = code !== null;
 
   const charger = useCallback(async () => {
@@ -799,13 +1067,17 @@ export default function LigueBabyfoot() {
     setOnglet("classement");
   };
   const supprimerMatch = (id) => agir(() => api.supprimerMatch(id, code));
+  const modifierMatch = (id, modif) => agir(() => api.modifierMatch(id, modif, code));
   const reinitialiser = () => agir(() => api.reinitialiser(code));
+
+  const allerAuxStats = (id) => { setSelection(id); setOnglet("stats"); };
 
   const ligue = useMemo(() => calculerLigue(data.joueurs, data.matchs), [data]);
 
   const onglets = [
     { id: "classement", label: "Classement" },
     { id: "match", label: "Nouveau match" },
+    { id: "stats", label: "Statistiques" },
     { id: "historique", label: "Historique" },
     { id: "joueurs", label: "Joueurs" },
   ];
@@ -845,9 +1117,11 @@ export default function LigueBabyfoot() {
         {chargement ? (
           <p className="bf-vide">Chargement du classement…</p>
         ) : onglet === "classement" ? (
-          <Classement ligue={ligue} mode={mode} setMode={setMode} />
+          <Classement ligue={ligue} mode={mode} setMode={setMode} onJoueur={allerAuxStats} />
         ) : onglet === "match" ? (
           <NouveauMatch ligue={ligue} joueurs={data.joueurs} onValider={ajouterMatch} />
+        ) : onglet === "stats" ? (
+          <Statistiques ligue={ligue} selection={selection} setSelection={setSelection} />
         ) : onglet === "historique" ? (
           <Historique
             ligue={ligue}
@@ -855,6 +1129,7 @@ export default function LigueBabyfoot() {
             onDeverrouiller={deverrouiller}
             verrouiller={verrouiller}
             onSupprimer={supprimerMatch}
+            onModifier={modifierMatch}
           />
         ) : (
           <Joueurs
@@ -1069,6 +1344,58 @@ const CSS = `
 .bf-pied{max-width:760px;margin:30px auto 0;padding:16px 18px 0;border-top:1px solid rgba(255,255,255,.09);
   font-size:12px;color:var(--craie-faible);text-align:center}
 
+/* lignes de classement cliquables */
+.bf-tr-clic{cursor:pointer;border-radius:6px;transition:background .12s}
+.bf-tr-clic:hover{background:rgba(255,255,255,.05)}
+
+/* historique : actions admin + édition en ligne */
+.bf-match-admin{position:absolute;top:10px;right:12px;display:flex;gap:12px}
+.bf-match-edit{display:block}
+.bf-edit-camps{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.bf-edit-camp{padding:12px;border-radius:8px;background:rgba(0,0,0,.22);border-top:3px solid}
+.bf-edit-camp.rouge{border-color:var(--rouge)}
+.bf-edit-camp.bleu{border-color:var(--bleu)}
+.bf-edit-camp h4{margin:0 0 10px;font-size:11px;letter-spacing:.16em;text-transform:uppercase}
+.bf-edit-camp.rouge h4{color:var(--rouge)}
+.bf-edit-camp.bleu h4{color:var(--bleu)}
+.bf-poste-mini{display:block;margin-bottom:8px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--craie-faible)}
+.bf-poste-mini .bf-select{margin-top:4px}
+.bf-edit-actions{display:flex;align-items:center;gap:14px;margin-top:14px}
+
+/* onglet statistiques */
+.bf-stat-choix{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.bf-chip{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:999px;
+  background:rgba(0,0,0,.22);font-size:13px;color:var(--craie);border:1px solid transparent;transition:background .12s}
+.bf-chip:hover{background:rgba(255,255,255,.08)}
+.bf-chip b{font-family:ui-monospace,Menlo,monospace;font-size:11px;font-weight:600;color:var(--craie-faible)}
+.bf-chip.on{border-color:#E8C15C;background:rgba(232,193,92,.12)}
+.bf-chip.on b{color:#E8C15C}
+.bf-stat-tete{margin:4px 0 20px;padding-bottom:16px;border-bottom:2px solid rgba(255,255,255,.14)}
+.bf-stat-nom{margin:0 0 8px;font-size:clamp(26px,6vw,38px);line-height:1;
+  font-family:"Haettenschweiler","Arial Narrow",Impact,sans-serif;font-weight:400;text-transform:uppercase}
+.bf-stat-kpis{display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}
+.bf-stat-kpis span{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--craie-faible)}
+.bf-stat-kpis b{font-family:ui-monospace,Menlo,monospace;font-size:24px;font-weight:700;color:var(--craie);margin-right:5px;letter-spacing:0}
+.bf-stat-kpis em{font-style:normal;margin-left:-3px}
+.bf-stat-elo{margin-left:auto}
+.bf-stat-grille{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.bf-stat-col{padding:16px;border-radius:10px;background:rgba(0,0,0,.18)}
+.bf-stat-col-titre{margin:0 0 4px;font-size:15px;font-weight:700}
+.bf-stat-leg{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:0 0 14px;font-size:11px;color:var(--craie-faible)}
+.bf-sw{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:2px}
+.bf-sw.clair{background:rgba(123,211,137,.28)}
+.bf-sw.fonce{background:var(--pos)}
+.bf-sw.fonce{margin-left:8px}
+.bf-duels{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+.bf-duels li{display:grid;grid-template-columns:72px 1fr auto;align-items:center;gap:8px}
+.bf-duel-nom{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bf-duel-barre{display:block}
+.bf-duel-fond{display:block;height:14px;border-radius:3px;background:rgba(123,211,137,.24);min-width:3px}
+.bf-duel-plein{display:block;height:100%;border-radius:3px;background:var(--pos)}
+.bf-duel-chiffre{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--craie);white-space:nowrap}
+.bf-duel-chiffre em{font-style:normal;color:var(--craie-faible)}
+.bf-duel-vide{padding:8px 0}
+
 @media (max-width:560px){
   .bf-logo-svg{width:74px}
   .bf-marque{font-size:10px;letter-spacing:.12em;padding:2px 8px}
@@ -1079,6 +1406,9 @@ const CSS = `
   .bf-camps{grid-template-columns:1fr;gap:12px}
   .bf-camps::before{display:none}
   .bf-j-elos b{font-size:13px}
+  .bf-stat-grille{grid-template-columns:1fr;gap:12px}
+  .bf-edit-camps{grid-template-columns:1fr;gap:12px}
+  .bf-stat-elo{margin-left:0}
 }
 @media (prefers-reduced-motion:reduce){
   .bf-root *{transition:none !important}

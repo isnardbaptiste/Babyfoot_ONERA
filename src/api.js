@@ -29,5 +29,6 @@ export const api = {
   retirerJoueur: (id, code) => envoyer("joueur:retirer", { id }, code),
   ajouterMatch: (match) => envoyer("match:ajouter", { match }),
   supprimerMatch: (id, code) => envoyer("match:supprimer", { id }, code),
+  modifierMatch: (id, match, code) => envoyer("match:modifier", { id, match }, code),
   reinitialiser: (code) => envoyer("reinitialiser", {}, code),
 };
