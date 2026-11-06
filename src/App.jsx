@@ -374,8 +374,18 @@ const affScore = (n) => (n < 0 ? "−" + Math.abs(n) : String(n));
 
 /* ── Vues ──────────────────────────────────────────────────── */
 
-function Classement({ ligue, mode, setMode, onJoueur }) {
+function Classement({ ligue, mode, setMode, onJoueur, palmaresParCat, saisons }) {
   const c = ligue.coefs;
+  const palmaresMode = (palmaresParCat && palmaresParCat[mode]) || {};
+  // Coupes de tenant : podium (de la catégorie affichée) de la saison la plus récemment close.
+  const coupes = useMemo(() => {
+    const arch = saisons || [];
+    if (!arch.length || !arch[0].awards) return {};
+    const podium = arch[0].awards[mode] || [];
+    const c2 = {};
+    podium.forEach((id, i) => { if (id) c2[id] = i + 1; });
+    return c2;
+  }, [saisons, mode]);
   // Seuls les joueurs actifs (un match dans la fenêtre d'inactivité) figurent au classement.
   const lignes = useMemo(
     () => ligue.classement.filter((p) => p.actif).sort((a, b) => b[mode] - a[mode]),
@@ -444,6 +454,8 @@ function Classement({ ligue, mode, setMode, onJoueur }) {
               <span className="bf-c-nom">
                 <span className="bf-nom-ligne">
                   {p.nom}
+                  <Palmes palmares={palmaresMode} id={p.id} />
+                  {coupes[p.id] && <Coupe rang={MEDAILLES[coupes[p.id] - 1]} place={coupes[p.id]} />}
                   {haut && <b className={"bf-tag haut h" + (i + 1)}>{haut}</b>}
                   {bas && <b className="bf-tag bas">{bas}</b>}
                 </span>
@@ -1347,6 +1359,247 @@ function Formule({ ligue, admin, onDeverrouiller, verrouiller, onDefinir }) {
   );
 }
 
+/* ── Onglet Saison ─────────────────────────────────────────── */
+
+// La saison d'une date : 1er sept → 31 août. "AAAA-AAAA+1".
+function saisonDe(dateIso) {
+  const d = new Date(dateIso);
+  const an = d.getUTCFullYear();
+  const debut = d.getUTCMonth() >= 8 ? an : an - 1;
+  return `${debut}-${debut + 1}`;
+}
+
+const MEDAILLES = ["or", "argent", "bronze"]; // index 0,1,2 = 1er,2e,3e
+
+// Une étoile (award) : or, argent ou bronze.
+function Etoile({ rang, titre }) {
+  return (
+    <svg viewBox="0 0 24 24" className={"bf-etoile " + rang} role="img" aria-label={titre}>
+      <title>{titre}</title>
+      <path d="M12 2.6l2.6 5.9 6.4.6-4.8 4.2 1.4 6.3L12 16.9 6.4 19.6l1.4-6.3L3 9.1l6.4-.6z"
+        fill="currentColor" stroke="rgba(0,0,0,.25)" strokeWidth="0.6" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// Une coupe de tenant du titre, avec le numéro de place.
+function Coupe({ rang, place }) {
+  return (
+    <span className={"bf-coupe " + rang} title={`Tenant du titre — ${place}${place === 1 ? "er" : "e"}`}>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7 4h10v3a5 5 0 0 1-10 0z" fill="currentColor" />
+        <path d="M7 5H4.5a2.5 2.5 0 0 0 2.5 3M17 5h2.5a2.5 2.5 0 0 1-2.5 3"
+          fill="none" stroke="currentColor" strokeWidth="1.5" />
+        <path d="M10 11h4v3h-4zM8 19h8v1.6H8zM9.5 14h5l-.4 5h-4.2z" fill="currentColor" />
+      </svg>
+      <b>{place}</b>
+    </span>
+  );
+}
+
+// Les petites étoiles cumulées d'un joueur, affichées à côté du pseudo.
+function Palmes({ palmares, id }) {
+  const p = palmares[id];
+  if (!p || (!p.or && !p.argent && !p.bronze)) return null;
+  return (
+    <span className="bf-palmes" aria-label={`${p.or} or, ${p.argent} argent, ${p.bronze} bronze`}>
+      {p.or > 0 && <span className="bf-palme or"><Etoile rang="or" titre="étoile(s) or" />{p.or > 1 && <em>{p.or}</em>}</span>}
+      {p.argent > 0 && <span className="bf-palme argent"><Etoile rang="argent" titre="étoile(s) argent" />{p.argent > 1 && <em>{p.argent}</em>}</span>}
+      {p.bronze > 0 && <span className="bf-palme bronze"><Etoile rang="bronze" titre="étoile(s) bronze" />{p.bronze > 1 && <em>{p.bronze}</em>}</span>}
+    </span>
+  );
+}
+
+// Tableau de classement d'une saison. `coupes` = { id: place } pour les tenants du titre.
+function TableSaison({ lignes, mode, palmares, coupes }) {
+  if (!lignes.length) {
+    return <p className="bf-muet bf-saison-vide">Aucun joueur classé.</p>;
+  }
+  return (
+    <div className="bf-table bf-table-saison" role="table">
+      <div className="bf-tr bf-thead" role="row">
+        <span className="bf-c-rang">#</span>
+        <span className="bf-c-nom">Joueur</span>
+        {MODES.map((m) => (
+          <span key={m.id} className={"bf-c-elo" + (mode === m.id ? " actif" : "")}>{m.label.slice(0, 3)}</span>
+        ))}
+      </div>
+      {lignes.map((p, i) => (
+        <div className="bf-tr" role="row" key={p.id || p.nom}>
+          <span className="bf-c-rang"><i className={"bf-rang r" + (i < 3 ? i + 1 : 0)}>{i + 1}</i></span>
+          <span className="bf-c-nom">
+            <span className="bf-nom-ligne">
+              {p.nom}
+              {coupes && coupes[p.id] && <Coupe rang={MEDAILLES[coupes[p.id] - 1]} place={coupes[p.id]} />}
+              {palmares && <Palmes palmares={palmares} id={p.id} />}
+            </span>
+          </span>
+          {MODES.map((m) => (
+            <span key={m.id} className={"bf-c-elo" + (mode === m.id ? " actif" : "")}>{Math.round(p[m.id])}</span>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Additionne les étoiles de toutes les saisons : palmares[id] = {nom, or, argent, bronze}.
+// Palmarès détaillé par catégorie : parCat[cat][id] = {nom, or, argent, bronze}.
+// Les étoiles restent rattachées à leur catégorie d'obtention.
+function cumulParCategorie(archives, index) {
+  const parCat = { general: {}, attaque: {}, defense: {} };
+  const ajoute = (cat, id, cle) => {
+    if (!id) return;
+    const t = parCat[cat];
+    const nom = index[id]?.nom || id;
+    const e = t[id] || (t[id] = { id, nom, or: 0, argent: 0, bronze: 0 });
+    e[cle] += 1;
+  };
+  for (const s of archives) {
+    if (!s.awards) continue;
+    for (const cat of ["general", "attaque", "defense"]) {
+      const podium = s.awards[cat] || [];
+      if (podium[0]) ajoute(cat, podium[0], "or");
+      if (podium[1]) ajoute(cat, podium[1], "argent");
+      if (podium[2]) ajoute(cat, podium[2], "bronze");
+    }
+  }
+  return parCat;
+}
+
+// Somme des trois catégories : total[id] = {nom, or, argent, bronze} toutes catégories confondues.
+function totalPalmares(parCat, index) {
+  const tot = {};
+  for (const cat of ["general", "attaque", "defense"]) {
+    for (const e of Object.values(parCat[cat])) {
+      const t = tot[e.id] || (tot[e.id] = { id: e.id, nom: index[e.id]?.nom || e.nom, or: 0, argent: 0, bronze: 0 });
+      t.or += e.or; t.argent += e.argent; t.bronze += e.bronze;
+    }
+  }
+  return tot;
+}
+
+function Saisons({ ligue, saisons, palmaresParCat }) {
+  const [mode, setMode] = useState("general");
+
+  const archives = saisons || [];
+  const dernierMatch = ligue.matchs[0];
+  const saisonCourante = saisonDe(dernierMatch ? dernierMatch.date : new Date().toISOString());
+
+  // Onglets du sélecteur : "Palmarès" d'abord, puis la saison en cours, puis les archives.
+  const options = useMemo(
+    () => [
+      { code: "palmares", palmares: true },
+      { code: saisonCourante, encours: true },
+      ...archives.map((s) => ({ code: s.saison, encours: false })),
+    ],
+    [saisonCourante, archives]
+  );
+  const [choix, setChoix] = useState(saisonCourante);
+  const vraiChoix = options.some((o) => o.code === choix) ? choix : saisonCourante;
+  const estPalmares = vraiChoix === "palmares";
+  const estCourante = vraiChoix === saisonCourante;
+
+  // Palmarès de la catégorie affichée (étoiles gagnées dans cette catégorie).
+  const palmaresListe = useMemo(() => {
+    const t = (palmaresParCat && palmaresParCat[mode]) || {};
+    return Object.values(t)
+      .map((p) => ({ ...p, total: p.or * 3 + p.argent * 2 + p.bronze }))
+      .sort((a, b) => b.or - a.or || b.argent - a.argent || b.bronze - a.bronze || b.total - a.total);
+  }, [palmaresParCat, mode]);
+
+  // Classement de la saison choisie (sans étoiles ni coupes : tout cela est dans l'onglet Classement).
+  const courant = useMemo(
+    () => ligue.classement.filter((p) => p.stats.general.j > 0).sort((a, b) => b[mode] - a[mode]),
+    [ligue, mode]
+  );
+  const archiveChoisie = archives.find((s) => s.saison === vraiChoix);
+  const lignes = estCourante
+    ? courant
+    : archiveChoisie ? [...archiveChoisie.classement].sort((a, b) => b[mode] - a[mode]) : [];
+
+  const libelle = (s) => "Saison " + s.replace("-", "–");
+  const labelMode = MODES.find((m) => m.id === mode).label;
+
+  return (
+    <>
+      <div className="bf-stat-choix" role="tablist" aria-label="Choisir une saison">
+        {options.map((o) => (
+          <button key={o.code} role="tab" aria-selected={o.code === vraiChoix}
+            className={"bf-chip" + (o.code === vraiChoix ? " on" : "") + (o.palmares ? " bf-chip-palm" : "")}
+            onClick={() => setChoix(o.code)}>
+            {o.palmares ? "Palmarès" : o.code.replace("-", "–")}{o.encours && <b>en cours</b>}
+          </button>
+        ))}
+      </div>
+
+      <div className="bf-segments" role="tablist" aria-label="Catégorie">
+        {MODES.map((m) => (
+          <button key={m.id} role="tab" aria-selected={mode === m.id}
+            className={"bf-seg" + (mode === m.id ? " on" : "")} onClick={() => setMode(m.id)}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      {estPalmares ? (
+        palmaresListe.length ? (
+          <section className="bf-saison-bloc">
+            <h2 className="bf-saison-titre bf-palm-titre">
+              Palmarès <span className="bf-palm-sous">{labelMode} · toutes saisons</span>
+            </h2>
+            <div className="bf-table bf-table-saison" role="table">
+              <div className="bf-tr bf-palm-tr bf-thead" role="row">
+                <span className="bf-c-rang">#</span>
+                <span className="bf-c-nom">Joueur</span>
+                <span className="bf-palm-c"><Etoile rang="or" titre="or" /></span>
+                <span className="bf-palm-c"><Etoile rang="argent" titre="argent" /></span>
+                <span className="bf-palm-c"><Etoile rang="bronze" titre="bronze" /></span>
+              </div>
+              {palmaresListe.map((p, i) => (
+                <div className="bf-tr bf-palm-tr" role="row" key={p.id}>
+                  <span className="bf-c-rang"><i className={"bf-rang r" + (i < 3 ? i + 1 : 0)}>{i + 1}</i></span>
+                  <span className="bf-c-nom"><span className="bf-nom-ligne">{p.nom}</span></span>
+                  <span className="bf-palm-c or">{p.or || "·"}</span>
+                  <span className="bf-palm-c argent">{p.argent || "·"}</span>
+                  <span className="bf-palm-c bronze">{p.bronze || "·"}</span>
+                </div>
+              ))}
+            </div>
+            <p className="bf-note">
+              Étoiles gagnées sur les podiums <b>{labelMode.toLowerCase()}</b> de toutes les saisons terminées.
+              Changez de catégorie ci-dessus pour l'attaque ou la défense.
+            </p>
+          </section>
+        ) : (
+          <div className="bf-vide">
+            <p>Aucun palmarès en {labelMode.toLowerCase()} pour l'instant.</p>
+            <p className="bf-vide-sous">Les étoiles arrivent à la fin de la première saison.</p>
+          </div>
+        )
+      ) : (
+        <>
+          <section className="bf-saison-bloc">
+            <h2 className="bf-saison-titre">
+              {libelle(vraiChoix)}
+              <span className={estCourante ? "bf-saison-encours" : "bf-saison-close"}>
+                {estCourante ? "en cours" : "terminée"}
+              </span>
+            </h2>
+            <TableSaison lignes={lignes} mode={mode} palmares={null} coupes={null} />
+          </section>
+
+          <p className="bf-note">
+            Une saison va du 1er septembre au 31 août. À la clôture, le podium de chaque catégorie reçoit une étoile
+            or, argent ou bronze (voir l'onglet Palmarès) et tout le monde repart à {ligue.coefs.depart}.
+            Les coupes et étoiles s'affichent dans l'onglet Classement.
+          </p>
+        </>
+      )}
+    </>
+  );
+}
+
 function Joueurs({ ligue, joueurs, matchs, admin, onDeverrouiller, verrouiller, onAjouter, onRenommer, onSupprimer, onReinitialiser }) {
   const [nom, setNom] = useState("");
   const [err, setErr] = useState("");
@@ -1572,13 +1825,20 @@ export default function LigueBabyfoot() {
     [data]
   );
 
+  // Palmarès par catégorie (étoiles cumulées), partagé entre Classement et Saison.
+  const palmaresParCat = useMemo(
+    () => cumulParCategorie(data.saisons || [], ligue.index),
+    [data.saisons, ligue.index]
+  );
+
   const onglets = [
     { id: "classement", label: "Classement" },
     { id: "match", label: "Nouveau match" },
     { id: "stats", label: "Statistiques" },
     { id: "graphiques", label: "Graphiques" },
+    { id: "saison", label: "Saisons" },
     { id: "historique", label: "Historique" },
-    { id: "formule", label: "Formule" },
+    { id: "formule", label: "Formules" },
     { id: "joueurs", label: "Joueurs" },
   ];
 
@@ -1617,13 +1877,15 @@ export default function LigueBabyfoot() {
         {chargement ? (
           <p className="bf-vide">Chargement du classement…</p>
         ) : onglet === "classement" ? (
-          <Classement ligue={ligue} mode={mode} setMode={setMode} onJoueur={allerAuxStats} />
+          <Classement ligue={ligue} mode={mode} setMode={setMode} onJoueur={allerAuxStats} palmaresParCat={palmaresParCat} saisons={data.saisons} />
         ) : onglet === "match" ? (
           <NouveauMatch ligue={ligue} joueurs={data.joueurs} onValider={ajouterMatch} />
         ) : onglet === "stats" ? (
           <Statistiques ligue={ligue} selection={selection} setSelection={setSelection} />
         ) : onglet === "graphiques" ? (
           <Graphiques ligue={ligue} selection={selection} setSelection={setSelection} />
+        ) : onglet === "saison" ? (
+          <Saisons ligue={ligue} saisons={data.saisons} palmaresParCat={palmaresParCat} />
         ) : onglet === "historique" ? (
           <Historique
             ligue={ligue}
@@ -1962,6 +2224,47 @@ const CSS = `
 .bf-formchamp-ok code{font-family:ui-monospace,Menlo,monospace;color:var(--craie-faible)}
 .bf-formchamp-err{margin:0;font-size:12px;color:var(--neg)}
 .bf-f-custom{display:inline-block;font-size:11px;color:#E8C15C;font-style:normal;margin-top:2px}
+
+/* onglet saison */
+.bf-saison-bloc{margin-bottom:26px}
+.bf-saison-titre{display:flex;align-items:center;gap:10px;margin:0 0 12px;font-size:clamp(18px,4vw,24px);
+  font-family:"Haettenschweiler","Arial Narrow",Impact,sans-serif;font-weight:400;text-transform:uppercase;letter-spacing:.01em}
+.bf-saison-encours{font-family:Inter,system-ui,sans-serif;font-size:10px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;padding:3px 8px;border-radius:999px;background:rgba(123,211,137,.18);color:var(--pos)}
+.bf-saison-close{font-family:Inter,system-ui,sans-serif;font-size:10px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.1);color:var(--craie-faible)}
+.bf-table-saison{border-top:1px solid rgba(255,255,255,.16)}
+.bf-saison-vide{padding:16px 0}
+.bf-saison-tenants{margin:-6px 0 12px;font-size:12px;color:var(--craie-faible)}
+/* étoiles (awards) */
+.bf-etoile{width:14px;height:14px;flex:none}
+.bf-etoile.or{color:#F0C752}
+.bf-etoile.argent{color:#CBD2D8}
+.bf-etoile.bronze{color:#C8894E}
+.bf-palmes{display:inline-flex;align-items:center;gap:5px;margin-left:3px}
+.bf-palme{display:inline-flex;align-items:center;gap:1px}
+.bf-palme em{font-style:normal;font-size:10px;font-weight:700;font-family:ui-monospace,Menlo,monospace}
+.bf-palme.or em{color:#F0C752}
+.bf-palme.argent em{color:#CBD2D8}
+.bf-palme.bronze em{color:#C8894E}
+/* coupe de tenant */
+.bf-coupe{display:inline-flex;align-items:center;gap:1px;margin-left:2px}
+.bf-coupe svg{width:15px;height:15px}
+.bf-coupe b{font-size:10px;font-weight:800;font-family:ui-monospace,Menlo,monospace}
+.bf-coupe.or{color:#F0C752}
+.bf-coupe.argent{color:#CBD2D8}
+.bf-coupe.bronze{color:#C8894E}
+/* tableau palmarès */
+.bf-palm-titre{margin-top:4px}
+.bf-palm-sous{font-family:Inter,system-ui,sans-serif;font-size:11px;font-weight:600;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--craie-faible)}
+.bf-palm-tr{grid-template-columns:32px 1fr 44px 44px 44px}
+.bf-palm-c{display:flex;align-items:center;justify-content:center;font-family:ui-monospace,Menlo,monospace;
+  font-size:14px;font-weight:700}
+.bf-palm-c.or{color:#F0C752}
+.bf-palm-c.argent{color:#CBD2D8}
+.bf-palm-c.bronze{color:#C8894E}
+.bf-palm-tr .bf-palm-c svg{width:15px;height:15px}
 
 @media (max-width:560px){
   .bf-logo-svg{width:74px}
