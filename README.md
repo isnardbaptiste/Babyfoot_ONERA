@@ -70,7 +70,7 @@ resterait vide.
 Ouvert à tous : consulter les classements, inscrire un joueur, enregistrer un match.
 
 Sous le code de la ligue : renommer un joueur, modifier ou supprimer un match, réinitialiser le
-classement. Retirer un joueur est ouvert après un an sans match, et demande le code avant.
+classement, changer les coefficients et les formules du modèle Elo. Retirer un joueur est ouvert après un an sans match, et demande le code avant.
 
 Le code est vérifié **dans la fonction serveur**, pas dans le navigateur. Contrairement
 à un contrôle côté client, il n'apparaît nulle part dans le code source de la page.
