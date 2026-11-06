@@ -8,10 +8,21 @@ import { Redis } from "@upstash/redis";
 const CLE_JOUEURS = "bf:joueurs";
 const CLE_MATCHS = "bf:matchs";
 const CLE_COEFS = "bf:coefs";
+const CLE_SAISONS = "bf:saisons";          // classements finaux archivés (léger, affiché)
+const CLE_ARCHIVE = (s) => `bf:archive:${s}`; // sauvegarde complète des matchs d'une saison close
 
 const AN_MS = 365 * 24 * 60 * 60 * 1000;
 const MIN_SCORE = -5;
 const MAX_SCORE = 10;
+
+// ── Saisons : du 1er septembre au 31 août ──
+// La saison d'une date est "AAAA-AAAA+1" ; une date de janv-août appartient à l'année-1.
+function saisonDe(dateIso) {
+  const d = new Date(dateIso);
+  const an = d.getUTCFullYear();
+  const debut = d.getUTCMonth() >= 8 ? an : an - 1; // mois 8 = septembre
+  return `${debut}-${debut + 1}`;
+}
 
 // Coefficients par défaut du modèle Elo. Une base déjà en place qui n'a pas
 // encore d'entrée "bf:coefs" utilise exactement ces valeurs : rien ne change
@@ -163,17 +174,121 @@ async function litCoefs(redis) {
   return c && typeof c === "object" ? { ...COEFS_DEFAUT, ...c } : { ...COEFS_DEFAUT };
 }
 
+async function litSaisons(redis) {
+  let brut = null;
+  try { brut = await redis.get(CLE_SAISONS); } catch (e) {}
+  const s = typeof brut === "string" ? JSON.parse(brut) : brut;
+  return Array.isArray(s) ? s : [];
+}
+
 async function etat(redis) {
-  const [j, m, coefs] = await Promise.all([
+  const [j, m, coefs, saisons] = await Promise.all([
     redis.hgetall(CLE_JOUEURS),
     redis.hgetall(CLE_MATCHS),
     litCoefs(redis),
+    litSaisons(redis),
   ]);
   return {
     joueurs: valeurs(j).sort((a, b) => (a.depuis || "").localeCompare(b.depuis || "")),
     matchs: valeurs(m).sort((a, b) => a.date.localeCompare(b.date)),
     coefs,
+    saisons, // [{ saison, fin, classement: [{id,nom,general,attaque,defense}] }], plus récente d'abord
   };
+}
+
+// Clôt toutes les saisons antérieures à celle de `dateReference` (incluse si strictement passée).
+// Pour chaque saison close : fige l'Elo final, archive les matchs, puis les supprime.
+// Renvoie la liste des codes de saisons closes (vide si rien à faire).
+async function cloreSaisonsAvant(redis, dateReference, joueurs, matchs, coefs) {
+  const saisonCourante = saisonDe(dateReference);
+  // Regrouper les matchs stockés par saison ; ne clore que celles AVANT la saison courante.
+  const parSaison = {};
+  for (const m of matchs) {
+    const s = saisonDe(m.date);
+    if (s < saisonCourante) (parSaison[s] || (parSaison[s] = [])).push(m);
+  }
+  const aClore = Object.keys(parSaison).sort(); // de la plus ancienne à la plus récente
+  if (!aClore.length) return [];
+
+  const saisonsArch = await litSaisons(redis);
+  for (const s of aClore) {
+    const ms = parSaison[s];
+    const classement = eloFinaux(joueurs, ms, coefs)
+      .sort((a, b) => b.general - a.general);
+    const fin = ms.reduce((max, m) => (m.date > max ? m.date : max), "");
+    const awards = awardsDe(classement); // podium or/argent/bronze par catégorie
+    // archive complète (silencieuse) puis suppression des matchs de la saison
+    await redis.set(CLE_ARCHIVE(s), JSON.stringify({ saison: s, matchs: ms }));
+    await redis.hdel(CLE_MATCHS, ...ms.map((m) => m.id));
+    // remplace une éventuelle entrée existante de cette saison
+    const idx = saisonsArch.findIndex((x) => x.saison === s);
+    const entree = { saison: s, fin, classement, awards };
+    if (idx >= 0) saisonsArch[idx] = entree; else saisonsArch.push(entree);
+  }
+  saisonsArch.sort((a, b) => b.saison.localeCompare(a.saison)); // plus récente d'abord
+  await redis.set(CLE_SAISONS, JSON.stringify(saisonsArch));
+  return aClore;
+}
+
+// Awards d'une saison : pour chaque catégorie, le top 3 reçoit or/argent/bronze.
+// Renvoie { general: [id1,id2,id3], attaque: [...], defense: [...] } (les ids du podium, dans l'ordre).
+function awardsDe(classement) {
+  const podium = (cat) => [...classement]
+    .sort((a, b) => b[cat] - a[cat])
+    .slice(0, 3)
+    .map((p) => p.id);
+  return { general: podium("general"), attaque: podium("attaque"), defense: podium("defense") };
+}
+
+// Calcule l'Elo final (général/attaque/défense) de chaque joueur ayant joué,
+// à partir d'une liste de matchs et des coefficients. Version serveur allégée
+// de calculerLigue : mêmes formules, sans les courbes ni les stats de confrontation.
+function eloFinaux(joueurs, matchs, coefs) {
+  const esper = (a, b) => 1 / (1 + Math.pow(10, (b - a) / 400));
+  // multiplicateur et delta, standard ou formule personnalisée (déjà validée au stockage)
+  let fnMult = null, fnDelta = null;
+  if (coefs.formuleMult) { const r = compilerFormule(coefs.formuleMult, VARS_MULT); if (r.fn) fnMult = r.fn; }
+  if (coefs.formuleDelta) { const r = compilerFormule(coefs.formuleDelta, VARS_DELTA); if (r.fn) fnDelta = r.fn; }
+  const mult = (e) => {
+    const ea = Math.abs(e);
+    if (fnMult) { try { const v = fnMult({ ecart: ea }); if (isFinite(v)) return v; } catch (x) {} }
+    for (const p of coefs.paliers) if (ea >= p.ecart) return p.facteur;
+    return 1;
+  };
+  const inactifMs = coefs.inactiviteJours * 24 * 60 * 60 * 1000;
+
+  const etat = {};
+  joueurs.forEach((j) => { etat[j.id] = { id: j.id, attaque: coefs.depart, defense: coefs.depart, general: coefs.depart, dernierJoue: null, joue: false }; });
+
+  for (const m of [...matchs].sort((a, b) => a.date.localeCompare(b.date))) {
+    const ids = [m.a.atk, m.a.def, m.b.atk, m.b.def];
+    if (ids.some((id) => !etat[id])) continue;
+    const quand = new Date(m.date).getTime();
+    for (const id of ids) { const p = etat[id]; if (p.dernierJoue !== null && quand - p.dernierJoue > inactifMs) { p.attaque = coefs.depart; p.defense = coefs.depart; p.general = coefs.depart; } }
+    const nA = (etat[m.a.atk].attaque + etat[m.a.def].defense) / 2, nB = (etat[m.b.atk].attaque + etat[m.b.def].defense) / 2;
+    const ecart = Math.abs(m.sa - m.sb), mu = mult(ecart);
+    const resA = m.sa > m.sb ? 1 : m.sa < m.sb ? 0 : 0.5, E = esper(nA, nB);
+    let brut = fnDelta ? (() => { try { const v = fnDelta({ K: coefs.k, mult: mu, E, res: resA, ecart }); return isFinite(v) ? v : coefs.k * mu * (resA - E); } catch (x) { return coefs.k * mu * (resA - E); } })() : coefs.k * mu * (resA - E);
+    const spec = brut >= 0 ? Math.max(brut, coefs.plancher) : Math.min(brut, -coefs.plancher);
+    const mem = [
+      { id: m.a.atk, role: "attaque", s: 1 }, { id: m.a.def, role: "defense", s: 1 },
+      { id: m.b.atk, role: "attaque", s: -1 }, { id: m.b.def, role: "defense", s: -1 },
+    ];
+    for (const mb of mem) {
+      const p = etat[mb.id], dS = spec * mb.s;
+      p.attaque += dS * (mb.role === "attaque" ? coefs.partRole : 1 - coefs.partRole);
+      p.defense += dS * (mb.role === "defense" ? coefs.partRole : 1 - coefs.partRole);
+      p.general = (p.attaque + p.defense) / 2;
+      p.dernierJoue = quand; p.joue = true;
+    }
+  }
+
+  // nom figé pour l'archive (le pseudo peut changer ensuite)
+  const nomDe = Object.fromEntries(joueurs.map((j) => [j.id, j.nom]));
+  return Object.values(etat).filter((p) => p.joue).map((p) => ({
+    id: p.id, nom: nomDe[p.id],
+    general: Math.round(p.general), attaque: Math.round(p.attaque), defense: Math.round(p.defense),
+  }));
 }
 
 // Valide un jeu de coefficients envoyé par le client. Renvoie {coefs} nettoyé ou {erreur}.
@@ -280,7 +395,7 @@ export default async function handler(req, res) {
       if (action === "verifier") return res.status(200).json({ ok: true });
     }
 
-    const { joueurs, matchs } = await etat(redis);
+    const { joueurs, matchs, coefs } = await etat(redis);
 
     switch (action) {
       case "joueur:ajouter": {
@@ -325,9 +440,13 @@ export default async function handler(req, res) {
         const m = corps.match || {};
         const err = erreurMatch(m, joueurs);
         if (err) return res.status(400).json({ erreur: err });
+        const maintenant = new Date().toISOString();
+        // Si ce match ouvre une nouvelle saison, clôturer d'abord la (ou les) saison(s) passée(s) :
+        // Elo final figé + archive + suppression des matchs. Automatique, sans confirmation.
+        await cloreSaisonsAvant(redis, maintenant, joueurs, matchs, coefs);
         const match = {
           id: crypto.randomUUID(),
-          date: new Date().toISOString(),
+          date: maintenant,
           a: { atk: m.a.atk, def: m.a.def },
           b: { atk: m.b.atk, def: m.b.def },
           sa: m.sa,
