@@ -13,7 +13,7 @@ const MIN_SCORE = -5;
 const MAX_SCORE = 10;
 
 const OUVERT = ["joueur:ajouter", "match:ajouter"];
-const PROTEGE = ["verifier", "joueur:renommer", "match:supprimer", "reinitialiser"];
+const PROTEGE = ["verifier", "joueur:renommer", "match:supprimer", "match:modifier", "reinitialiser"];
 // Retirer un joueur est ouvert après un an d'inactivité, sinon il faut le code.
 const MIXTE = ["joueur:retirer"];
 
@@ -45,6 +45,19 @@ const joueursDuMatch = (m) => [m.a.atk, m.a.def, m.b.atk, m.b.def];
 
 function scoreValide(n) {
   return Number.isInteger(n) && n >= MIN_SCORE && n <= MAX_SCORE;
+}
+
+// Valide le contenu d'un match. Renvoie une chaîne d'erreur, ou null si tout est bon.
+function erreurMatch(m, joueurs) {
+  const ids = [m?.a?.atk, m?.a?.def, m?.b?.atk, m?.b?.def];
+  if (ids.some((id) => !id) || new Set(ids).size !== 4)
+    return "Il faut quatre joueurs différents.";
+  if (ids.some((id) => !joueurs.some((j) => j.id === id)))
+    return "Un des joueurs n'est plus inscrit.";
+  if (!scoreValide(m.sa) || !scoreValide(m.sb))
+    return `Les scores vont de ${MIN_SCORE} à ${MAX_SCORE}.`;
+  if (m.sa === m.sb) return "Il faut un vainqueur.";
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -128,18 +141,29 @@ export default async function handler(req, res) {
 
       case "match:ajouter": {
         const m = corps.match || {};
-        const ids = [m?.a?.atk, m?.a?.def, m?.b?.atk, m?.b?.def];
-        if (ids.some((id) => !id) || new Set(ids).size !== 4)
-          return res.status(400).json({ erreur: "Il faut quatre joueurs différents." });
-        if (ids.some((id) => !joueurs.some((j) => j.id === id)))
-          return res.status(400).json({ erreur: "Un des joueurs n'est plus inscrit." });
-        if (!scoreValide(m.sa) || !scoreValide(m.sb))
-          return res.status(400).json({ erreur: `Les scores vont de ${MIN_SCORE} à ${MAX_SCORE}.` });
-        if (m.sa === m.sb)
-          return res.status(400).json({ erreur: "Il faut un vainqueur." });
+        const err = erreurMatch(m, joueurs);
+        if (err) return res.status(400).json({ erreur: err });
         const match = {
           id: crypto.randomUUID(),
           date: new Date().toISOString(),
+          a: { atk: m.a.atk, def: m.a.def },
+          b: { atk: m.b.atk, def: m.b.def },
+          sa: m.sa,
+          sb: m.sb,
+        };
+        await redis.hset(CLE_MATCHS, { [match.id]: JSON.stringify(match) });
+        break;
+      }
+
+      case "match:modifier": {
+        const ancien = matchs.find((m) => m.id === corps.id);
+        if (!ancien) return res.status(404).json({ erreur: "Match introuvable." });
+        const m = corps.match || {};
+        const err = erreurMatch(m, joueurs);
+        if (err) return res.status(400).json({ erreur: err });
+        // On garde l'identifiant et la date d'origine : seuls joueurs et score changent.
+        const match = {
+          ...ancien,
           a: { atk: m.a.atk, def: m.a.def },
           b: { atk: m.b.atk, def: m.b.def },
           sa: m.sa,
