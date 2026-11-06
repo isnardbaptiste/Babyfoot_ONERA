@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { api } from "./api";
+import { compilerFormule } from "./formule";
+
+// Variables mises à disposition des formules personnalisées.
+const VARS_DELTA = ["K", "mult", "E", "res", "ecart"];
+const VARS_MULT = ["ecart"];
 
 /* ────────────────────────────────────────────────────────────
    LIGUE DU MIDI — classement Elo de baby-foot 2v2
@@ -8,32 +13,45 @@ import { api } from "./api";
    ce qui rend la suppression d'un match ou d'un joueur exacte.
    ──────────────────────────────────────────────────────────── */
 
-const START = 1500;
-const K = 24;
-const PLANCHER = 4; // variation minimale, quel que soit l'écart de niveau
-const PART_ROLE = 0.75; // part de la variation sur le poste tenu, le reste sur l'autre
 const MIN_SCORE = -5;
 const MAX_SCORE = 10;
 const PERLES_NEG = Array.from({ length: -MIN_SCORE }, (_, i) => MIN_SCORE + i); // -5 … -1
 const PERLES_POS = Array.from({ length: MAX_SCORE }, (_, i) => i + 1); // 1 … 10
 const AN_MS = 365 * 24 * 60 * 60 * 1000;
-const INACTIF_MS = 91 * 24 * 60 * 60 * 1000; // ~3 mois sans jouer → sortie du classement, Elo remis à 1500
+const JOUR_MS = 24 * 60 * 60 * 1000;
 const MODES = [
   { id: "general", label: "Général" },
   { id: "attaque", label: "Attaque" },
   { id: "defense", label: "Défense" },
 ];
 
+// Coefficients par défaut, identiques au serveur. Servent de secours quand la
+// ligue n'a pas encore renvoyé les siens (premier chargement).
+const COEFS_DEFAUT = {
+  depart: 1500,
+  k: 24,
+  plancher: 4,
+  partRole: 0.75,
+  inactiviteJours: 91,
+  paliers: [
+    { ecart: 8, facteur: 5 },
+    { ecart: 7, facteur: 4 },
+    { ecart: 6, facteur: 3 },
+    { ecart: 4, facteur: 2 },
+    { ecart: 1, facteur: 1 },
+  ],
+};
+// Quelques valeurs encore lues directement par des libellés d'interface.
+const START = COEFS_DEFAUT.depart;
+const K = COEFS_DEFAUT.k;
+const PLANCHER = COEFS_DEFAUT.plancher;
+
 /* ── Maths Elo ─────────────────────────────────────────────── */
 
-// Multiplicateur par palier d'écart de buts.
-// 1 à 3 → ×1 · 4 à 5 → ×2 · 6 → ×3 · 7 → ×4 · 8 et plus → ×5
-function facteurEcart(ecart) {
+// Multiplicateur par palier d'écart de buts (comportement standard).
+function multPaliers(ecart, coefs) {
   const e = Math.abs(ecart);
-  if (e >= 8) return 5;
-  if (e === 7) return 4;
-  if (e === 6) return 3;
-  if (e >= 4) return 2;
+  for (const p of coefs.paliers) if (e >= p.ecart) return p.facteur; // paliers triés décroissant
   return 1;
 }
 
@@ -41,7 +59,31 @@ function esperance(noteEquipe, noteAdverse) {
   return 1 / (1 + Math.pow(10, (noteAdverse - noteEquipe) / 400));
 }
 
-function deltasMatch(etat, m) {
+// Prépare, une fois par recalcul, les fonctions "mult" et "delta" à employer.
+// Chaque formule personnalisée valide remplace le calcul standard ; sinon on garde le standard.
+function prepareModele(coefs) {
+  let fnMult = null, fnDelta = null;
+  if (coefs.formuleMult) {
+    const r = compilerFormule(coefs.formuleMult, VARS_MULT);
+    if (r.fn) fnMult = r.fn; // en cas d'erreur on ignore et on garde les paliers
+  }
+  if (coefs.formuleDelta) {
+    const r = compilerFormule(coefs.formuleDelta, VARS_DELTA);
+    if (r.fn) fnDelta = r.fn;
+  }
+  const mult = (ecart) => {
+    if (fnMult) { try { return fnMult({ ecart: Math.abs(ecart) }); } catch (e) {} }
+    return multPaliers(ecart, coefs);
+  };
+  const delta = (K, m, E, res, ecart) => {
+    if (fnDelta) { try { return fnDelta({ K, mult: m, E, res, ecart: Math.abs(ecart) }); } catch (e) {} }
+    return K * m * (res - E);
+  };
+  return { mult, delta };
+}
+
+function deltasMatch(etat, m, coefs, modele) {
+  const mod = modele || prepareModele(coefs);
   const aAtk = etat[m.a.atk], aDef = etat[m.a.def];
   const bAtk = etat[m.b.atk], bDef = etat[m.b.def];
 
@@ -50,30 +92,27 @@ function deltasMatch(etat, m) {
   const noteB = (bAtk.attaque + bDef.defense) / 2;
 
   const ecart = Math.abs(m.sa - m.sb);
-  const mult = facteurEcart(ecart);
+  const mult = mod.mult(ecart);
   const resA = m.sa > m.sb ? 1 : m.sa < m.sb ? 0 : 0.5;
-  const brut = K * mult * (resA - esperance(noteA, noteB));
-  // Le vainqueur gagne au moins 4 points, le perdant en laisse autant.
-  const spec = brut >= 0 ? Math.max(brut, PLANCHER) : Math.min(brut, -PLANCHER);
+  const E = esperance(noteA, noteB);
+  let brut = mod.delta(coefs.k, mult, E, resA, ecart);
+  if (typeof brut !== "number" || !isFinite(brut)) brut = coefs.k * mult * (resA - E); // sécurité
+  // Le vainqueur gagne au moins "plancher", le perdant en laisse autant.
+  const spec = brut >= 0 ? Math.max(brut, coefs.plancher) : Math.min(brut, -coefs.plancher);
 
-  return {
-    spec,
-    noteA,
-    noteB,
-    mult,
-    proba: esperance(noteA, noteB),
-  };
+  return { spec, noteA, noteB, mult, proba: E };
 }
 
-function ligneVide(id, nom) {
+function ligneVide(id, nom, depart) {
   const role = () => ({
     j: 0, v: 0, d: 0, bp: 0, bc: 0, forme: [], dernier: 0,
     // confrontations par mode : coequipiers[idAutre] = {j, v}, adversaires[idAutre] = {j, v}
     coequipiers: {}, adversaires: {},
+    courbe: {}, // Elo de fin de journée : { "AAAA-MM-JJ": elo }
   });
   return {
     id, nom,
-    general: START, attaque: START, defense: START,
+    general: depart, attaque: depart, defense: depart,
     dernierJoue: null, // date du dernier match joué, pour la règle d'inactivité
     stats: { general: role(), attaque: role(), defense: role() },
   };
@@ -86,9 +125,13 @@ function noter(table, autreId, gagne) {
   if (gagne) e.v += 1;
 }
 
-function calculerLigue(joueurs, matchs, maintenant = Date.now()) {
+const jourDe = (ms) => new Date(ms).toISOString().slice(0, 10); // "AAAA-MM-JJ" en UTC
+
+function calculerLigue(joueurs, matchs, coefs = COEFS_DEFAUT, maintenant = Date.now()) {
+  const inactifMs = coefs.inactiviteJours * JOUR_MS;
+  const modele = prepareModele(coefs); // compile les formules une seule fois
   const etat = {};
-  joueurs.forEach((j) => { etat[j.id] = ligneVide(j.id, j.nom); });
+  joueurs.forEach((j) => { etat[j.id] = ligneVide(j.id, j.nom, coefs.depart); });
 
   const ordonnes = [...matchs].sort((x, y) => x.date.localeCompare(y.date));
   const enrichis = [];
@@ -97,19 +140,20 @@ function calculerLigue(joueurs, matchs, maintenant = Date.now()) {
     const ids = [m.a.atk, m.a.def, m.b.atk, m.b.def];
     if (ids.some((id) => !etat[id])) continue; // joueur supprimé : match ignoré
     const quand = new Date(m.date).getTime();
+    const jour = jourDe(quand);
 
-    // Règle d'inactivité : une absence de plus de 3 mois coupe le fil de l'Elo.
-    // Au retour, le joueur repart de 1500 (attaque et défense) avant de jouer ce match.
+    // Inactivité : une absence de plus de N jours coupe le fil de l'Elo.
+    // Au retour, le joueur repart de "depart" (attaque et défense) avant ce match.
     for (const id of ids) {
       const p = etat[id];
-      if (p.dernierJoue !== null && quand - p.dernierJoue > INACTIF_MS) {
-        p.attaque = START;
-        p.defense = START;
-        p.general = START;
+      if (p.dernierJoue !== null && quand - p.dernierJoue > inactifMs) {
+        p.attaque = coefs.depart;
+        p.defense = coefs.depart;
+        p.general = coefs.depart;
       }
     }
 
-    const d = deltasMatch(etat, m);
+    const d = deltasMatch(etat, m, coefs, modele);
 
     const membres = [
       { id: m.a.atk, role: "attaque", eq: "a", coeq: m.a.def, adv: [m.b.atk, m.b.def] },
@@ -123,9 +167,9 @@ function calculerLigue(joueurs, matchs, maintenant = Date.now()) {
       const signe = mb.eq === "a" ? 1 : -1;
       const dSpec = d.spec * signe;
 
-      // Le poste tenu prend 3/4 de la variation, l'autre poste le quart restant.
-      const dAtt = dSpec * (mb.role === "attaque" ? PART_ROLE : 1 - PART_ROLE);
-      const dDef = dSpec * (mb.role === "defense" ? PART_ROLE : 1 - PART_ROLE);
+      // Le poste tenu prend "partRole" de la variation, l'autre poste le reste.
+      const dAtt = dSpec * (mb.role === "attaque" ? coefs.partRole : 1 - coefs.partRole);
+      const dDef = dSpec * (mb.role === "defense" ? coefs.partRole : 1 - coefs.partRole);
       p.attaque += dAtt;
       p.defense += dDef;
       // Le général suit mécaniquement : moyenne de l'attaque et de la défense.
@@ -149,19 +193,24 @@ function calculerLigue(joueurs, matchs, maintenant = Date.now()) {
         noter(s.coequipiers, mb.coeq, gagne);
         mb.adv.forEach((idAdv) => noter(s.adversaires, idAdv, gagne));
       }
+
+      // Elo de fin de journée pour la courbe : on écrase, le dernier match du jour gagne.
+      p.stats.general.courbe[jour] = p.general;
+      p.stats.attaque.courbe[jour] = p.attaque;
+      p.stats.defense.courbe[jour] = p.defense;
     }
 
     enrichis.push({ ...m, delta: d.spec, mult: d.mult, moyA: d.noteA, moyB: d.noteB });
   }
 
-  // Un joueur est "actif" s'il a joué dans les 3 derniers mois. Les inactifs
+  // Un joueur est "actif" s'il a joué dans la fenêtre d'inactivité. Les inactifs
   // sortent du classement (mais gardent leur historique et leurs stats de saison).
   const classement = Object.values(etat).map((p) => ({
     ...p,
-    actif: p.dernierJoue !== null && maintenant - p.dernierJoue <= INACTIF_MS,
+    actif: p.dernierJoue !== null && maintenant - p.dernierJoue <= inactifMs,
   }));
 
-  return { classement, index: Object.fromEntries(classement.map((p) => [p.id, p])), matchs: enrichis.reverse() };
+  return { classement, index: Object.fromEntries(classement.map((p) => [p.id, p])), matchs: enrichis.reverse(), coefs };
 }
 
 /* ── Petits éléments graphiques ────────────────────────────── */
@@ -304,13 +353,30 @@ function Choix({ value, onChange, joueurs, exclus, placeholder }) {
 const MENTIONS_HAUT = ["[GOAT]", "[LEGEND]", "[PRO]"]; // 1er, 2e, 3e
 const MENTIONS_BAS = ["[KIKELACHEVRE]", "[POMPEALOOSE]", "[NAINDEPATTYA]"]; // dernier, avant-dernier, …
 
+// Décrit les paliers du multiplicateur en une phrase, ex. "×1 de 1 à 3 · ×2 de 4 à 5 · ×5 à partir de 8".
+function decrirePaliers(coefs) {
+  const tries = [...coefs.paliers].sort((a, b) => a.ecart - b.ecart); // du plus petit au plus grand
+  return tries
+    .map((p, i) => {
+      const suivant = tries[i + 1];
+      const borne = suivant ? suivant.ecart - 1 : null;
+      const plage = i === tries.length - 1
+        ? `à partir de ${p.ecart}`
+        : p.ecart === borne ? `à ${p.ecart}` : `de ${p.ecart} à ${borne}`;
+      return `×${p.facteur} ${plage}`;
+    })
+    .join(" · ");
+}
+const moisEnv = (jours) => Math.round(jours / 30);
+
 const signe = (n) => (n > 0 ? "+" : n < 0 ? "−" : "±") + Math.abs(Math.round(n));
 const affScore = (n) => (n < 0 ? "−" + Math.abs(n) : String(n));
 
 /* ── Vues ──────────────────────────────────────────────────── */
 
 function Classement({ ligue, mode, setMode, onJoueur }) {
-  // Seuls les joueurs actifs (un match dans les 3 derniers mois) figurent au classement.
+  const c = ligue.coefs;
+  // Seuls les joueurs actifs (un match dans la fenêtre d'inactivité) figurent au classement.
   const lignes = useMemo(
     () => ligue.classement.filter((p) => p.actif).sort((a, b) => b[mode] - a[mode]),
     [ligue, mode]
@@ -407,16 +473,16 @@ function Classement({ ligue, mode, setMode, onJoueur }) {
         })}
       </div>
       <p className="bf-note">
-        Touchez un joueur pour ses statistiques. Départ à {START} · général = moyenne attaque/défense · K={K} ·
-        variation minimale de {PLANCHER} points.
+        Touchez un joueur pour ses statistiques. Départ à {c.depart} · général = moyenne attaque/défense · K={c.k} ·
+        variation minimale de {c.plancher} points.
         <br />
-        Le poste tenu prend 3/4 de la variation, l'autre poste 1/4. Multiplicateur d'écart de buts :
-        ×1 de 1 à 3 · ×2 de 4 à 5 · ×3 à 6 · ×4 à 7 · ×5 à partir de 8.
+        Le poste tenu prend {Math.round(c.partRole * 100)} % de la variation, l'autre poste le reste.
+        Multiplicateur d'écart de buts : {decrirePaliers(c)}.
         {inactifs > 0 && (
           <>
             <br />
-            {inactifs} joueur{inactifs > 1 ? "s" : ""} masqué{inactifs > 1 ? "s" : ""} pour plus de 3 mois sans jouer ·
-            un match les ramène, Elo remis à {START}.
+            {inactifs} joueur{inactifs > 1 ? "s" : ""} masqué{inactifs > 1 ? "s" : ""} pour plus de {moisEnv(c.inactiviteJours)} mois sans jouer ·
+            un match les ramène, Elo remis à {c.depart}.
           </>
         )}
       </p>
@@ -439,7 +505,7 @@ function NouveauMatch({ ligue, joueurs, onValider }) {
     if (!complet || nulMatch) return null;
     const m = { a, b, sa, sb };
     if ([m.a.atk, m.a.def, m.b.atk, m.b.def].some((id) => !ligue.index[id])) return null;
-    return deltasMatch(ligue.index, m);
+    return deltasMatch(ligue.index, m, ligue.coefs);
   }, [complet, nulMatch, a, b, sa, sb, ligue]);
 
   const valider = () => {
@@ -519,8 +585,9 @@ function NouveauMatch({ ligue, joueurs, onValider }) {
               { id: b.def, role: "defense", sens: -1 },
             ].map((l, k) => {
               const d = apercu.spec * l.sens;
-              const dAtt = d * (l.role === "attaque" ? PART_ROLE : 1 - PART_ROLE);
-              const dDef = d * (l.role === "defense" ? PART_ROLE : 1 - PART_ROLE);
+              const pr = ligue.coefs.partRole;
+              const dAtt = d * (l.role === "attaque" ? pr : 1 - pr);
+              const dDef = d * (l.role === "defense" ? pr : 1 - pr);
               const cl = d > 0 ? "pos" : "neg";
               return (
                 <li key={k}>
@@ -853,6 +920,433 @@ function Statistiques({ ligue, selection, setSelection }) {
   );
 }
 
+/* ── Onglet Graphiques ─────────────────────────────────────── */
+
+const PALETTE = ["#E8C15C","#3277E0","#DC3049","#7BD389","#C08552","#B07CE0","#45C4D6","#E8734A","#9FB3A8","#F0866A"];
+
+// Courbe d'Elo jour par jour pour les joueurs sélectionnés, dans un mode donné.
+function CourbeElo({ series, modeLabel }) {
+  const W = 720, H = 300, mL = 44, mR = 14, mT = 14, mB = 34;
+  const tous = series.flatMap((s) => s.points);
+  if (tous.length < 1) {
+    return <p className="bf-muet bf-graph-vide">Pas encore de données à tracer.</p>;
+  }
+  const jours = [...new Set(tous.map((p) => p.jour))].sort();
+  const idxJour = Object.fromEntries(jours.map((j, i) => [j, i]));
+  const nJours = Math.max(1, jours.length - 1);
+
+  let lo = Math.min(...tous.map((p) => p.elo));
+  let hi = Math.max(...tous.map((p) => p.elo));
+  const marge = Math.max(20, (hi - lo) * 0.12);
+  lo = Math.floor((lo - marge) / 10) * 10;
+  hi = Math.ceil((hi + marge) / 10) * 10;
+
+  const x = (jour) => mL + (nJours ? idxJour[jour] / nJours : 0) * (W - mL - mR);
+  const y = (elo) => mT + (1 - (elo - lo) / (hi - lo)) * (H - mT - mB);
+
+  // graduations Y : 4 repères
+  const ticks = Array.from({ length: 4 }, (_, i) => Math.round(lo + ((hi - lo) * i) / 3));
+  // quelques dates en X
+  const pas = Math.max(1, Math.ceil(jours.length / 6));
+  const datesX = jours.filter((_, i) => i % pas === 0);
+  const jjmm = (j) => `${j.slice(8, 10)}/${j.slice(5, 7)}`;
+
+  return (
+    <div className="bf-graph-wrap">
+      <svg viewBox={`0 0 ${W} ${H}`} className="bf-graph-svg" role="img"
+        aria-label={`Évolution de l'Elo en ${modeLabel}`}>
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={mL} x2={W - mR} y1={y(t)} y2={y(t)} className="bf-grid" />
+            <text x={mL - 6} y={y(t) + 4} className="bf-axe" textAnchor="end">{t}</text>
+          </g>
+        ))}
+        {datesX.map((j) => (
+          <text key={j} x={x(j)} y={H - 12} className="bf-axe" textAnchor="middle">{jjmm(j)}</text>
+        ))}
+        {series.map((s) => {
+          if (!s.points.length) return null;
+          const d = s.points.map((p, i) => `${i ? "L" : "M"}${x(p.jour).toFixed(1)} ${y(p.elo).toFixed(1)}`).join(" ");
+          return (
+            <g key={s.id}>
+              <path d={d} fill="none" stroke={s.couleur} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" />
+              {s.points.length === 1 && <circle cx={x(s.points[0].jour)} cy={y(s.points[0].elo)} r="3.5" fill={s.couleur} />}
+              <circle cx={x(s.points[s.points.length - 1].jour)} cy={y(s.points[s.points.length - 1].elo)} r="3.5" fill={s.couleur} />
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// Barres horizontales de victoires / défaites pour les joueurs sélectionnés.
+function BarresVD({ series }) {
+  const max = Math.max(1, ...series.map((s) => s.j));
+  return (
+    <ul className="bf-vd">
+      {series.map((s) => {
+        const pct = s.j ? Math.round((s.v / s.j) * 100) : 0;
+        return (
+          <li key={s.id}>
+            <span className="bf-vd-nom" style={{ color: s.couleur }}>{s.nom}</span>
+            <span className="bf-vd-barre" style={{ width: (s.j / max) * 100 + "%" }}>
+              <span className="bf-vd-v" style={{ width: pct + "%" }} />
+            </span>
+            <span className="bf-vd-chiffre">{pct}<em>%</em> · {s.v}<i>V</i> {s.d}<i>D</i></span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function Graphiques({ ligue, selection, setSelection }) {
+  const [mode, setMode] = useState("general");
+
+  // On ne propose que les joueurs actifs ayant au moins un match, triés par Elo du mode.
+  const dispo = useMemo(
+    () => ligue.classement
+      .filter((p) => p.actif && p.stats.general.j > 0)
+      .sort((a, b) => b[mode] - a[mode]),
+    [ligue, mode]
+  );
+
+  // Sélection par défaut : les 3 premiers, une fois, si rien n'est choisi.
+  const [choix, setChoix] = useState(() => new Set(selection ? [selection] : []));
+  useEffect(() => {
+    setChoix((prev) => {
+      if (prev.size) return prev;
+      const base = selection ? [selection] : dispo.slice(0, 3).map((p) => p.id);
+      return new Set(base.filter((id) => dispo.some((p) => p.id === id)));
+    });
+    // eslint-disable-next-line
+  }, [dispo.length]);
+
+  const bascule = (id) => {
+    setChoix((prev) => {
+      const n = new Set(prev);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+    setSelection(null);
+  };
+
+  const couleurDe = {};
+  [...choix].forEach((id, i) => { couleurDe[id] = PALETTE[i % PALETTE.length]; });
+
+  const series = [...choix]
+    .map((id) => ligue.index[id])
+    .filter(Boolean)
+    .map((p) => {
+      const s = p.stats[mode];
+      const points = Object.entries(s.courbe)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([jour, elo]) => ({ jour, elo }));
+      return { id: p.id, nom: p.nom, couleur: couleurDe[p.id], points, j: s.j, v: s.v, d: s.d };
+    });
+
+  if (!dispo.length) {
+    return (
+      <div className="bf-vide">
+        <p>Aucun joueur actif à tracer.</p>
+        <p className="bf-vide-sous">Les courbes apparaissent dès les premiers matchs.</p>
+      </div>
+    );
+  }
+
+  const labelMode = MODES.find((m) => m.id === mode).label;
+
+  return (
+    <>
+      <div className="bf-segments" role="tablist" aria-label="Type de courbe">
+        {MODES.map((m) => (
+          <button key={m.id} role="tab" aria-selected={mode === m.id}
+            className={"bf-seg" + (mode === m.id ? " on" : "")} onClick={() => setMode(m.id)}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      <p className="bf-graph-consigne">Choisissez les joueurs à comparer :</p>
+      <div className="bf-stat-choix">
+        {dispo.map((p) => {
+          const on = choix.has(p.id);
+          return (
+            <button key={p.id}
+              className={"bf-chip" + (on ? " on" : "")}
+              style={on ? { borderColor: couleurDe[p.id], background: couleurDe[p.id] + "22" } : undefined}
+              onClick={() => bascule(p.id)}>
+              {on && <i className="bf-puce" style={{ background: couleurDe[p.id] }} />}
+              {p.nom}<b>{Math.round(p[mode])}</b>
+            </button>
+          );
+        })}
+      </div>
+
+      {series.length ? (
+        <>
+          <h3 className="bf-graph-titre">Évolution de l'Elo en {labelMode.toLowerCase()}</h3>
+          <CourbeElo series={series} modeLabel={labelMode} />
+          <h3 className="bf-graph-titre">Victoires et défaites</h3>
+          <BarresVD series={series} />
+          <p className="bf-note">
+            Un point par jour joué : l'Elo en fin de journée. Les pourcentages de victoire portent sur
+            tous les matchs du joueur en {labelMode.toLowerCase()}.
+          </p>
+        </>
+      ) : (
+        <p className="bf-muet bf-graph-vide">Sélectionnez au moins un joueur ci-dessus.</p>
+      )}
+    </>
+  );
+}
+
+/* ── Onglet Formule & coefficients ─────────────────────────── */
+
+// Champ d'édition d'une formule, avec contrôle de validité en direct.
+function ChampFormule({ label, valeur, onChange, variables, standard, apercu }) {
+  const vide = !valeur || !valeur.trim();
+  const etat = useMemo(() => {
+    if (vide) return { ok: true, standard: true };
+    const r = compilerFormule(valeur, variables);
+    if (r.erreur) return { ok: false, msg: r.erreur };
+    try {
+      const v = r.fn(apercu.vars);
+      if (!isFinite(v)) return { ok: false, msg: "Résultat non fini." };
+      return { ok: true, exemple: v };
+    } catch (e) { return { ok: false, msg: e.message }; }
+  }, [valeur, variables, apercu]);
+
+  return (
+    <div className="bf-formchamp">
+      <div className="bf-formchamp-tete">
+        <label>{label}</label>
+        <button type="button" className="bf-lien" onClick={() => onChange("")}>formule standard</button>
+      </div>
+      <input
+        className={"bf-input bf-mono" + (etat.ok ? "" : " invalide")}
+        value={valeur || ""}
+        placeholder={standard}
+        onChange={(e) => onChange(e.target.value)}
+        spellCheck={false}
+      />
+      <p className="bf-formchamp-aide">
+        Variables : <b>{variables.join(", ")}</b> · fonctions : min, max, abs, log, sqrt, exp, pow.
+      </p>
+      {etat.standard ? (
+        <p className="bf-formchamp-ok">Vide = formule standard : <code>{standard}</code></p>
+      ) : etat.ok ? (
+        <p className="bf-formchamp-ok">Valide · {apercu.libelle} → <b>{etat.exemple.toFixed(2)}</b></p>
+      ) : (
+        <p className="bf-formchamp-err">{etat.msg}</p>
+      )}
+    </div>
+  );
+}
+
+function Formule({ ligue, admin, onDeverrouiller, verrouiller, onDefinir }) {
+  const c = ligue.coefs;
+  const [brouillon, setBrouillon] = useState(null); // copie éditable quand on règle
+  const [err, setErr] = useState("");
+  const [confirme, setConfirme] = useState(false);
+
+  // (Re)synchronise le brouillon sur les coefficients courants à l'ouverture de l'édition.
+  const ouvrirEdition = () => { setBrouillon(JSON.parse(JSON.stringify(c))); setErr(""); setConfirme(false); };
+
+  const champ = (cle, valeur) => setBrouillon((b) => ({ ...b, [cle]: valeur }));
+  const champPalier = (i, cle, valeur) =>
+    setBrouillon((b) => ({ ...b, paliers: b.paliers.map((p, k) => (k === i ? { ...p, [cle]: valeur } : p)) }));
+
+  const enregistrer = async () => {
+    const b = brouillon;
+    const nb = (v) => (v === "" || v === null ? NaN : Number(v));
+    const coefs = {
+      depart: nb(b.depart), k: nb(b.k), plancher: nb(b.plancher),
+      partRole: nb(b.partRole), inactiviteJours: nb(b.inactiviteJours),
+      paliers: b.paliers.map((p) => ({ ecart: nb(p.ecart), facteur: nb(p.facteur) })),
+      // chaîne vide = retour au standard ; le serveur revalide de toute façon.
+      formuleDelta: (b.formuleDelta || "").trim(),
+      formuleMult: (b.formuleMult || "").trim(),
+    };
+    try {
+      await onDefinir(coefs);
+      setBrouillon(null); setConfirme(false); setErr("");
+    } catch (e) {
+      setErr(e.message);
+    }
+  };
+
+  const Val = ({ children }) => <b className="bf-f-val">{children}</b>;
+
+  return (
+    <>
+      <div className="bf-formule">
+        <h2 className="bf-f-titre">Comment l'Elo est calculé</h2>
+
+        <section className="bf-f-bloc">
+          <h3>1 · La force d'une équipe</h3>
+          <p>
+            Chaque joueur a deux notes, une en attaque et une en défense. La force d'une équipe pour un match
+            est la moyenne de l'attaquant <em>en attaque</em> et du défenseur <em>en défense</em> :
+          </p>
+          <p className="bf-f-math">R<sub>équipe</sub> = ( Elo<sub>att</sub>(attaquant) + Elo<sub>déf</sub>(défenseur) ) / 2</p>
+        </section>
+
+        <section className="bf-f-bloc">
+          <h3>2 · La probabilité de gagner</h3>
+          <p>Face à l'équipe adverse de force R<sub>adv</sub>, l'espérance de victoire suit la formule Elo classique :</p>
+          <p className="bf-f-math">E = 1 / ( 1 + 10<sup>(R<sub>adv</sub> − R<sub>équipe</sub>) / 400</sup> )</p>
+          <p>Un écart de 400 points correspond à environ 10 chances sur 11.</p>
+        </section>
+
+        <section className="bf-f-bloc">
+          <h3>3 · Les points échangés</h3>
+          <p>Le résultat vaut 1 pour une victoire, 0 pour une défaite. La variation de base est :</p>
+          <p className="bf-f-math">Δ = {c.formuleDelta ? c.formuleDelta : "K × mult × ( résultat − E )"}</p>
+          {c.formuleDelta && <p className="bf-f-custom">Formule personnalisée en place.</p>}
+          <p>
+            où <Val>K = {c.k}</Val> règle l'ampleur générale, et <b>mult</b> dépend de l'écart de buts.
+            La variation est ensuite plafonnée à un minimum de <Val>{c.plancher} points</Val> pour le vainqueur
+            comme pour le perdant.
+          </p>
+          {c.formuleMult ? (
+            <p className="bf-f-math">mult = {c.formuleMult} <span className="bf-f-custom">personnalisée</span></p>
+          ) : (
+            <div className="bf-f-paliers">
+              {[...c.paliers].sort((a, b) => a.ecart - b.ecart).map((p, i, t) => {
+                const suiv = t[i + 1];
+                const borne = suiv ? suiv.ecart - 1 : null;
+                const plage = i === t.length - 1 ? `${p.ecart}+` : p.ecart === borne ? `${p.ecart}` : `${p.ecart}–${borne}`;
+                return <span key={i} className="bf-f-palier"><b>×{p.facteur}</b> écart {plage}</span>;
+              })}
+            </div>
+          )}
+        </section>
+
+        <section className="bf-f-bloc">
+          <h3>4 · La répartition entre les postes</h3>
+          <p>
+            Le poste réellement tenu reçoit <Val>{Math.round(c.partRole * 100)} %</Val> de la variation,
+            l'autre poste le reste. Le général est toujours la moyenne de l'attaque et de la défense.
+          </p>
+        </section>
+
+        <section className="bf-f-bloc">
+          <h3>5 · L'inactivité</h3>
+          <p>
+            Sans match depuis plus de <Val>{c.inactiviteJours} jours</Val> (≈ {moisEnv(c.inactiviteJours)} mois),
+            un joueur quitte le classement. S'il rejoue, son Elo repart de <Val>{c.depart}</Val> ;
+            ses anciens matchs restent dans l'historique et ses statistiques.
+          </p>
+        </section>
+      </div>
+
+      <section className="bf-zone">
+        <h3 className="bf-zone-titre">Réglage du modèle</h3>
+        {!admin ? (
+          <Deverrouiller
+            onDeverrouiller={onDeverrouiller}
+            texte="Modifier les coefficients demande le code de la ligue. Attention : tout changement recalcule l'intégralité du classement."
+          />
+        ) : !brouillon ? (
+          <>
+            <p className="bf-zone-texte ouverte">Zone déverrouillée.</p>
+            <div className="bf-ajout">
+              <button className="bf-cta petit" onClick={ouvrirEdition}>Modifier les coefficients</button>
+              <button className="bf-lien" onClick={verrouiller}>Verrouiller</button>
+            </div>
+          </>
+        ) : (
+          <div className="bf-reglage">
+            <p className="bf-reglage-avert">
+              Changer un coefficient recalcule tous les Elo depuis le premier match. L'historique des matchs
+              n'est pas modifié, mais chaque classement change.
+            </p>
+            <div className="bf-reglage-grille">
+              <label>Elo de départ
+                <input className="bf-input" type="number" value={brouillon.depart}
+                  onChange={(e) => champ("depart", e.target.value)} />
+              </label>
+              <label>K (ampleur)
+                <input className="bf-input" type="number" value={brouillon.k}
+                  onChange={(e) => champ("k", e.target.value)} />
+              </label>
+              <label>Variation minimale
+                <input className="bf-input" type="number" value={brouillon.plancher}
+                  onChange={(e) => champ("plancher", e.target.value)} />
+              </label>
+              <label>Part du poste tenu (0,5–1)
+                <input className="bf-input" type="number" step="0.05" value={brouillon.partRole}
+                  onChange={(e) => champ("partRole", e.target.value)} />
+              </label>
+              <label>Inactivité (jours)
+                <input className="bf-input" type="number" value={brouillon.inactiviteJours}
+                  onChange={(e) => champ("inactiviteJours", e.target.value)} />
+              </label>
+            </div>
+
+            <p className="bf-reglage-sous">Multiplicateur par écart de buts (écart minimum → facteur) :</p>
+            <div className="bf-reglage-paliers">
+              {brouillon.paliers.map((p, i) => (
+                <div className="bf-reglage-palier" key={i}>
+                  <span>à partir de</span>
+                  <input className="bf-input" type="number" value={p.ecart}
+                    onChange={(e) => champPalier(i, "ecart", e.target.value)} />
+                  <span>buts → ×</span>
+                  <input className="bf-input" type="number" value={p.facteur}
+                    onChange={(e) => champPalier(i, "facteur", e.target.value)} />
+                </div>
+              ))}
+            </div>
+
+            <details className="bf-avance">
+              <summary>Formules avancées (facultatif)</summary>
+              <p className="bf-reglage-sous">
+                Remplacez le calcul par votre propre expression. Laissez vide pour garder le calcul standard.
+                Une formule invalide est refusée à l'enregistrement.
+              </p>
+              <ChampFormule
+                label="Multiplicateur (mult)"
+                valeur={brouillon.formuleMult}
+                onChange={(v) => champ("formuleMult", v)}
+                variables={VARS_MULT}
+                standard="paliers ci-dessus"
+                apercu={{ vars: { ecart: 5 }, libelle: "écart 5" }}
+              />
+              <ChampFormule
+                label="Points échangés (Δ)"
+                valeur={brouillon.formuleDelta}
+                onChange={(v) => champ("formuleDelta", v)}
+                variables={VARS_DELTA}
+                standard="K * mult * (res - E)"
+                apercu={{ vars: { K: brouillon.k || 24, mult: 2, E: 0.5, res: 1, ecart: 4 }, libelle: "match gagné, mult 2" }}
+              />
+            </details>
+
+            {err && <p className="bf-erreur">{err}</p>}
+
+            {confirme ? (
+              <div className="bf-zone-confirm">
+                <p>Appliquer ces coefficients et recalculer tout le classement ?</p>
+                <div className="bf-ajout">
+                  <button className="bf-cta petit danger" onClick={enregistrer}>Oui, appliquer</button>
+                  <button className="bf-lien" onClick={() => setConfirme(false)}>Revenir</button>
+                </div>
+              </div>
+            ) : (
+              <div className="bf-ajout">
+                <button className="bf-cta petit" onClick={() => { setErr(""); setConfirme(true); }}>Enregistrer</button>
+                <button className="bf-lien" onClick={() => { setBrouillon(null); setErr(""); }}>Annuler</button>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
 function Joueurs({ ligue, joueurs, matchs, admin, onDeverrouiller, verrouiller, onAjouter, onRenommer, onSupprimer, onReinitialiser }) {
   const [nom, setNom] = useState("");
   const [err, setErr] = useState("");
@@ -1069,16 +1563,22 @@ export default function LigueBabyfoot() {
   const supprimerMatch = (id) => agir(() => api.supprimerMatch(id, code));
   const modifierMatch = (id, modif) => agir(() => api.modifierMatch(id, modif, code));
   const reinitialiser = () => agir(() => api.reinitialiser(code));
+  const definirCoefs = (coefs) => agir(() => api.definirCoefs(coefs, code));
 
   const allerAuxStats = (id) => { setSelection(id); setOnglet("stats"); };
 
-  const ligue = useMemo(() => calculerLigue(data.joueurs, data.matchs), [data]);
+  const ligue = useMemo(
+    () => calculerLigue(data.joueurs, data.matchs, data.coefs || COEFS_DEFAUT),
+    [data]
+  );
 
   const onglets = [
     { id: "classement", label: "Classement" },
     { id: "match", label: "Nouveau match" },
     { id: "stats", label: "Statistiques" },
+    { id: "graphiques", label: "Graphiques" },
     { id: "historique", label: "Historique" },
+    { id: "formule", label: "Formule" },
     { id: "joueurs", label: "Joueurs" },
   ];
 
@@ -1122,6 +1622,8 @@ export default function LigueBabyfoot() {
           <NouveauMatch ligue={ligue} joueurs={data.joueurs} onValider={ajouterMatch} />
         ) : onglet === "stats" ? (
           <Statistiques ligue={ligue} selection={selection} setSelection={setSelection} />
+        ) : onglet === "graphiques" ? (
+          <Graphiques ligue={ligue} selection={selection} setSelection={setSelection} />
         ) : onglet === "historique" ? (
           <Historique
             ligue={ligue}
@@ -1130,6 +1632,14 @@ export default function LigueBabyfoot() {
             verrouiller={verrouiller}
             onSupprimer={supprimerMatch}
             onModifier={modifierMatch}
+          />
+        ) : onglet === "formule" ? (
+          <Formule
+            ligue={ligue}
+            admin={admin}
+            onDeverrouiller={deverrouiller}
+            verrouiller={verrouiller}
+            onDefinir={definirCoefs}
           />
         ) : (
           <Joueurs
@@ -1396,6 +1906,63 @@ const CSS = `
 .bf-duel-chiffre em{font-style:normal;color:var(--craie-faible)}
 .bf-duel-vide{padding:8px 0}
 
+/* onglet graphiques */
+.bf-graph-consigne{margin:4px 0 8px;font-size:13px;color:var(--craie-faible)}
+.bf-puce{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}
+.bf-graph-titre{margin:22px 0 10px;font-size:15px;font-weight:700}
+.bf-graph-wrap{overflow-x:auto;border-radius:10px;background:rgba(0,0,0,.2);padding:12px}
+.bf-graph-svg{display:block;width:100%;min-width:420px;height:auto}
+.bf-grid{stroke:rgba(255,255,255,.1);stroke-width:1}
+.bf-axe{fill:var(--craie-faible);font-size:11px;font-family:ui-monospace,Menlo,monospace}
+.bf-graph-vide{padding:30px 0;text-align:center}
+.bf-vd{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.bf-vd li{display:grid;grid-template-columns:84px 1fr auto;align-items:center;gap:10px}
+.bf-vd-nom{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bf-vd-barre{display:block;height:16px;border-radius:4px;background:rgba(232,115,74,.28);min-width:4px;overflow:hidden}
+.bf-vd-v{display:block;height:100%;background:var(--pos)}
+.bf-vd-chiffre{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--craie);white-space:nowrap}
+.bf-vd-chiffre em{font-style:normal;color:var(--craie-faible)}
+.bf-vd-chiffre i{font-style:normal;color:var(--craie-faible);margin-left:1px}
+
+/* onglet formule */
+.bf-formule{max-width:620px}
+.bf-f-titre{margin:0 0 18px;font-size:clamp(22px,5vw,30px);line-height:1.05;
+  font-family:"Haettenschweiler","Arial Narrow",Impact,sans-serif;font-weight:400;text-transform:uppercase}
+.bf-f-bloc{margin-bottom:20px;padding-bottom:18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.bf-f-bloc h3{margin:0 0 8px;font-size:14px;letter-spacing:.04em;color:var(--craie)}
+.bf-f-bloc p{margin:0 0 8px;font-size:14px;color:var(--craie);line-height:1.5}
+.bf-f-bloc em{font-style:italic;color:var(--craie)}
+.bf-f-math{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px;color:#CFE8D6 !important;
+  background:rgba(0,0,0,.26);padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:nowrap}
+.bf-f-val{font-family:ui-monospace,Menlo,monospace;color:#E8C15C;font-weight:700}
+.bf-f-paliers{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.bf-f-palier{font-size:12px;padding:4px 9px;border-radius:999px;background:rgba(0,0,0,.26);color:var(--craie-faible)}
+.bf-f-palier b{color:var(--craie);font-family:ui-monospace,Menlo,monospace;margin-right:3px}
+.bf-reglage-avert{margin:0 0 14px;padding:10px 12px;font-size:13px;background:rgba(232,115,74,.14);
+  border-left:3px solid var(--neg);border-radius:0 6px 6px 0;color:var(--craie)}
+.bf-reglage-grille{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.bf-reglage-grille label,.bf-reglage-palier{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--craie-faible)}
+.bf-reglage-grille label{display:grid;gap:5px}
+.bf-reglage-grille .bf-input{text-transform:none;letter-spacing:0}
+.bf-reglage-sous{margin:0 0 10px;font-size:12px;color:var(--craie-faible)}
+.bf-reglage-paliers{display:grid;gap:8px;margin-bottom:16px}
+.bf-reglage-palier{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.bf-reglage-palier .bf-input{width:72px}
+.bf-avance{margin:4px 0 16px;padding:12px;border-radius:8px;background:rgba(0,0,0,.2)}
+.bf-avance summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--craie);letter-spacing:.02em}
+.bf-avance[open] summary{margin-bottom:12px}
+.bf-formchamp{margin-top:14px}
+.bf-formchamp-tete{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:5px}
+.bf-formchamp-tete label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--craie-faible)}
+.bf-mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px}
+.bf-mono.invalide{border-color:var(--neg);box-shadow:0 0 0 1px var(--neg)}
+.bf-formchamp-aide{margin:5px 0 4px;font-size:11px;color:var(--craie-faible)}
+.bf-formchamp-aide b{color:var(--craie);font-family:ui-monospace,Menlo,monospace}
+.bf-formchamp-ok{margin:0;font-size:12px;color:var(--pos)}
+.bf-formchamp-ok code{font-family:ui-monospace,Menlo,monospace;color:var(--craie-faible)}
+.bf-formchamp-err{margin:0;font-size:12px;color:var(--neg)}
+.bf-f-custom{display:inline-block;font-size:11px;color:#E8C15C;font-style:normal;margin-top:2px}
+
 @media (max-width:560px){
   .bf-logo-svg{width:74px}
   .bf-marque{font-size:10px;letter-spacing:.12em;padding:2px 8px}
@@ -1409,6 +1976,7 @@ const CSS = `
   .bf-stat-grille{grid-template-columns:1fr;gap:12px}
   .bf-edit-camps{grid-template-columns:1fr;gap:12px}
   .bf-stat-elo{margin-left:0}
+  .bf-reglage-grille{grid-template-columns:1fr}
 }
 @media (prefers-reduced-motion:reduce){
   .bf-root *{transition:none !important}

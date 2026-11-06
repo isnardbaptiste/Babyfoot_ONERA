@@ -31,4 +31,5 @@ export const api = {
   supprimerMatch: (id, code) => envoyer("match:supprimer", { id }, code),
   modifierMatch: (id, match, code) => envoyer("match:modifier", { id, match }, code),
   reinitialiser: (code) => envoyer("reinitialiser", {}, code),
+  definirCoefs: (coefs, code) => envoyer("coefs:definir", { coefs }, code),
 };
