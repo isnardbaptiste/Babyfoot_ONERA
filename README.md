@@ -69,7 +69,7 @@ resterait vide.
 
 Ouvert à tous : consulter les classements, inscrire un joueur, enregistrer un match.
 
-Sous le code de la ligue : renommer un joueur, supprimer un match, réinitialiser le
+Sous le code de la ligue : renommer un joueur, modifier ou supprimer un match, réinitialiser le
 classement. Retirer un joueur est ouvert après un an sans match, et demande le code avant.
 
 Le code est vérifié **dans la fonction serveur**, pas dans le navigateur. Contrairement
@@ -102,6 +102,7 @@ rétroactivement les Elo de chacun, sans dérive possible.
 - Multiplicateur d'écart de buts : ×1 de 1 à 3 · ×2 de 4 à 5 · ×3 à 6 · ×4 à 7 · ×5 à partir de 8.
 - Le poste tenu reçoit 3/4 de la variation, l'autre poste 1/4.
 - Scores de −5 à 10, égalité refusée.
+- Inactivité : sans match depuis plus de 3 mois, un joueur quitte le classement ; à son retour son Elo repart de 1500 (ses anciens matchs restent dans l'historique et ses statistiques de saison).
 
 Ces valeurs sont regroupées en haut de `src/App.jsx` (`START`, `K`, `PLANCHER`,
 `PART_ROLE`, `facteurEcart`) et dans `api/ligue.js` pour les bornes de score.
